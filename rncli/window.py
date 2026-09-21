@@ -1,0 +1,928 @@
+"""Ventana principal: pestañas, paneles, diseños y atajos."""
+
+from __future__ import annotations
+
+import os
+
+from PySide6.QtCore import QByteArray, QEvent, Qt, Signal
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication,
+    QDockWidget,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QTabWidget,
+    QToolBar,
+    QToolButton,
+    QWidget,
+)
+
+from . import APP_NAME, __version__
+from .agents import Agent, pick_default_agent
+from .config import LAYOUTS, Config, Settings, load_session, save_session
+from .dialogs import (
+    AgentChooserDialog,
+    SettingsDialog,
+    ShortcutsDialog,
+    SudoDialog,
+)
+from .file_browser import FileBrowserWidget
+from .layouts import LAYOUT_LABELS, WorkspaceWidget
+from .terminal import TerminalWidget
+from .theme import app_stylesheet
+
+
+class PromptBar(QLineEdit):
+    """Barra inferior para enviar un texto al panel activo (o a todos)."""
+
+    submitted = Signal(str, bool)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._normal_placeholder = (
+            "Escribe aquí y pulsa Enter para enviarlo al panel activo "
+            "(Ctrl+Enter = a todos los paneles)"
+        )
+        self._host_placeholder = (
+            "MODO RNCli · atajos activos · haz clic en una terminal para volver a escribir"
+        )
+        self.setPlaceholderText(
+            self._normal_placeholder
+        )
+
+    def set_host_mode(self, enabled: bool) -> None:
+        self.setProperty("hostMode", bool(enabled))
+        self.setPlaceholderText(self._host_placeholder if enabled else self._normal_placeholder)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            to_all = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            text = self.text()
+            if text.strip():
+                self.submitted.emit(text, to_all)
+                self.clear()
+            return
+        super().keyPressEvent(event)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.config = config
+        self.settings: Settings = config.settings
+        self._zoom_applied = 0
+        self._host_mode = False
+        self._shortcut_actions: list[QAction] = []
+
+        self.setWindowTitle(APP_NAME)
+        self.resize(1400, 900)
+        self.setWindowIcon(QGuiApplication.windowIcon())
+
+        self._build_actions()
+        self._build_toolbar()
+        self._build_tabs()
+        self._build_file_browser()
+        self._build_statusbar()
+        self._build_prompt()
+        # Mientras una terminal tiene el foco, Ctrl+T/Ctrl+W/etc. pertenecen
+        # al agente. Los atajos del chasis se habilitan con Ctrl derecho.
+        self._set_app_shortcuts(False)
+        self._restore_geometry()
+
+        self._restore_or_create_session()
+        self.apply_theme()
+        self._update_status()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        """Reenvía los atajos de RNCli cuando el foco está liberado."""
+        if event.type() == QEvent.Type.KeyPress:
+            focus = QApplication.focusWidget()
+            is_reverse_tab = (
+                event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
+                and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+                and not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            )
+            if is_reverse_tab and isinstance(focus, TerminalWidget) and not self._host_mode:
+                # Qt convierte Shift+Tab en Backtab y suele mover el foco antes
+                # de que la TUI vea la tecla. Entregar el protocolo VT aquí
+                # evita que el foco salte entre terminales.
+                focus.send_special(b"\x1b[Z")
+                event.accept()
+                return True
+        if self._host_mode and event.type() == QEvent.Type.KeyPress:
+            action = self._host_action(event)
+            if action is not None:
+                action.trigger()
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def _host_action(self, event) -> QAction | None:
+        key = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
+
+        if ctrl and shift and key == Qt.Key.Key_T:
+            return self.act_new_pane
+        if ctrl and not shift and key == Qt.Key.Key_T:
+            return self.act_new_tab
+        if ctrl and shift and key == Qt.Key.Key_W:
+            return self.act_close_tab
+        if ctrl and not shift and key == Qt.Key.Key_W:
+            return self.act_close_pane
+        if ctrl and shift and key == Qt.Key.Key_B:
+            return self.act_broadcast
+        if ctrl and shift and key == Qt.Key.Key_R:
+            return self.act_restart
+        if ctrl and shift and key == Qt.Key.Key_M:
+            return self.act_maximize
+        if ctrl and shift and key == Qt.Key.Key_C:
+            return self._host_copy_action
+        if ctrl and shift and key == Qt.Key.Key_V:
+            return self._host_paste_action
+        if ctrl and shift and key == Qt.Key.Key_A:
+            return self._host_select_action
+        if ctrl and key == Qt.Key.Key_Tab:
+            return self.act_prev_tab if shift else self.act_next_tab
+        if ctrl and key in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):
+            return self.act_zoom_in
+        if ctrl and key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+            return self.act_zoom_out
+        if ctrl and key == Qt.Key.Key_0:
+            return self.act_zoom_reset
+        if ctrl and key == Qt.Key.Key_Q:
+            return self.act_quit
+        if alt:
+            modes = {
+                Qt.Key.Key_1: "1", Qt.Key.Key_2: "2v", Qt.Key.Key_3: "2h",
+                Qt.Key.Key_4: "4", Qt.Key.Key_5: "6", Qt.Key.Key_0: "all",
+            }
+            if key in modes:
+                return self.act_layouts[modes[key]]
+            if key == Qt.Key.Key_Right:
+                return self.act_focus_next
+            if key == Qt.Key.Key_Left:
+                return self.act_focus_prev
+        if key == Qt.Key.Key_F1:
+            return self.act_help
+        if key == Qt.Key.Key_F2:
+            return self.act_rename_tab
+        if key == Qt.Key.Key_F11:
+            return self.act_fullscreen
+        return None
+
+    # ------------------------------------------------------------------ acciones
+    def _act(self, text: str, shortcut: str | None, slot, *, checkable: bool = False) -> QAction:
+        action = QAction(text, self)
+        if shortcut:
+            action.setShortcut(QKeySequence(shortcut))
+            action.setProperty("rncliShortcut", shortcut)
+            self._shortcut_actions.append(action)
+        action.setCheckable(checkable)
+        action.triggered.connect(slot)
+        self.addAction(action)
+        return action
+
+    def _set_app_shortcuts(self, enabled: bool) -> None:
+        """Activa/desactiva atajos del chasis sin desactivar sus acciones de menú."""
+        for action in self._shortcut_actions:
+            shortcut = action.property("rncliShortcut")
+            action.setShortcut(QKeySequence(str(shortcut)) if enabled and shortcut else QKeySequence())
+
+    def _build_actions(self) -> None:
+        self.act_new_tab = self._act("Nueva pestaña", "Ctrl+T", lambda: self.choose_agent(new_tab=True))
+        self.act_new_pane = self._act(
+            "Nuevo panel", "Ctrl+Shift+T", lambda: self.choose_agent(new_tab=False)
+        )
+        self.act_close_pane = self._act("Cerrar panel", "Ctrl+W", self.close_pane)
+        self.act_close_tab = self._act("Cerrar pestaña", "Ctrl+Shift+W", self.close_tab)
+        self.act_rename_tab = self._act("Renombrar pestaña", "F2", self.rename_tab)
+        self.act_next_tab = self._act("Pestaña siguiente", "Ctrl+Tab", lambda: self._cycle_tab(1))
+        self.act_prev_tab = self._act("Pestaña anterior", "Ctrl+Shift+Tab", lambda: self._cycle_tab(-1))
+        self.act_quit = self._act("Salir", "Ctrl+Q", self.close)
+        self.act_restart = self._act("Reiniciar agente", "Ctrl+Shift+R", self.restart_active)
+        self.act_focus_next = self._act("Panel siguiente", "Alt+Right", lambda: self._focus(1))
+        self.act_focus_prev = self._act("Panel anterior", "Alt+Left", lambda: self._focus(-1))
+        self.act_zoom_in = self._act("Aumentar letra", "Ctrl+=", lambda: self.zoom(+1))
+        self.act_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
+        self.act_zoom_out = self._act("Reducir letra", "Ctrl+-", lambda: self.zoom(-1))
+        self.act_zoom_reset = self._act("Tamaño normal", "Ctrl+0", lambda: self.zoom(reset=True))
+        self.act_maximize = self._act(
+            "Maximizar panel activo", "Ctrl+Shift+M", self.maximize_active
+        )
+        self.act_fullscreen = self._act("Pantalla completa", "F11", self.toggle_fullscreen, checkable=True)
+        self.act_broadcast = self._act(
+            "Difusión (escribir en todos)", "Ctrl+Shift+B", self.toggle_broadcast, checkable=True
+        )
+        self.act_settings = self._act("Ajustes…", None, self.open_settings)
+        self.act_open_config = self._act("Abrir config.json", None, self.open_config)
+        self.act_sudo = self._act("Sudo para agentes…", None, self.open_sudo)
+        self.act_help = self._act("Atajos y ayuda", "F1", self.open_help)
+
+        # Acciones internas que se disparan desde el Host Key aunque el foco
+        # esté temporalmente en la barra inferior.
+        self._host_copy_action = QAction("Copiar", self)
+        self._host_copy_action.triggered.connect(lambda: self._terminal_call("copy_selection"))
+        self._host_paste_action = QAction("Pegar", self)
+        self._host_paste_action.triggered.connect(lambda: self._terminal_call("paste"))
+        self._host_select_action = QAction("Seleccionar todo", self)
+        self._host_select_action.triggered.connect(lambda: self._terminal_call("select_all"))
+
+        self.layout_group = QActionGroup(self)
+        self.layout_group.setExclusive(True)
+        self.act_layouts: dict[str, QAction] = {}
+        for index, mode in enumerate(LAYOUTS):
+            shortcut = "Alt+0" if mode == "all" else f"Alt+{index + 1}"
+            action = self._act(
+                f"Diseño: {LAYOUT_LABELS[mode]}", shortcut, lambda _=False, m=mode: self.set_layout(m), checkable=True
+            )
+            self.layout_group.addAction(action)
+            self.act_layouts[mode] = action
+
+        self._build_menus()
+
+    def _build_menus(self) -> None:
+        bar = self.menuBar()
+
+        session_menu = bar.addMenu("&Sesión")
+        session_menu.addAction(self.act_new_tab)
+        session_menu.addAction(self.act_new_pane)
+        session_menu.addSeparator()
+        session_menu.addAction(self.act_close_pane)
+        session_menu.addAction(self.act_close_tab)
+        session_menu.addAction(self.act_rename_tab)
+        merge_tabs = QAction("Convertir todas las pestañas en paneles", self)
+        merge_tabs.setToolTip("Mueve sus terminales a la pestaña actual para poder verlas juntas")
+        merge_tabs.triggered.connect(self.merge_tabs_into_current)
+        self.act_merge_tabs = merge_tabs
+        session_menu.addAction(merge_tabs)
+        session_menu.addSeparator()
+        session_menu.addAction(self.act_next_tab)
+        session_menu.addAction(self.act_prev_tab)
+        session_menu.addSeparator()
+        session_menu.addAction(self.act_quit)
+
+        edit_menu = bar.addMenu("&Editar")
+        copy_action = QAction("Copiar selección  (Ctrl+Shift+C)", self)
+        copy_action.triggered.connect(lambda: self._terminal_call("copy_selection"))
+        paste_action = QAction("Pegar  (Ctrl+Shift+V)", self)
+        paste_action.triggered.connect(lambda: self._terminal_call("paste"))
+        select_all = QAction("Seleccionar todo  (Ctrl+Shift+A)", self)
+        select_all.triggered.connect(lambda: self._terminal_call("select_all"))
+        send_all = QAction("Escribir a todos los paneles", self)
+        send_all.triggered.connect(self.focus_prompt)
+        for action in (copy_action, paste_action, select_all, send_all):
+            edit_menu.addAction(action)
+
+        view_menu = bar.addMenu("&Ver")
+        layout_menu = view_menu.addMenu("Diseño")
+        for mode in LAYOUTS:
+            layout_menu.addAction(self.act_layouts[mode])
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_focus_next)
+        view_menu.addAction(self.act_focus_prev)
+        view_menu.addAction(self.act_maximize)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_broadcast)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_zoom_in)
+        view_menu.addAction(self.act_zoom_out)
+        view_menu.addAction(self.act_zoom_reset)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_fullscreen)
+
+        tools_menu = bar.addMenu("&Herramientas")
+        tools_menu.addAction(self.act_restart)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self.act_sudo)
+        tools_menu.addAction(self.act_open_config)
+        tools_menu.addAction(self.act_settings)
+
+        help_menu = bar.addMenu("A&yuda")
+        help_menu.addAction(self.act_help)
+        about = QAction(f"Acerca de {APP_NAME} {__version__}", self)
+        about.triggered.connect(self.open_about)
+        help_menu.addAction(about)
+
+    def _build_toolbar(self) -> None:
+        toolbar = QToolBar("Principal", self)
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        new_tab = QToolButton()
+        new_tab.setText("＋ Pestaña")
+        new_tab.setToolTip("Nueva pestaña con el agente que elijas (Ctrl+T)")
+        new_tab.clicked.connect(lambda: self.choose_agent(new_tab=True))
+        new_pane = QToolButton()
+        new_pane.setText("＋ Panel")
+        new_pane.setToolTip("Nuevo panel en la pestaña actual (Ctrl+Shift+T)")
+        new_pane.clicked.connect(lambda: self.choose_agent(new_tab=False))
+        toolbar.addWidget(new_tab)
+        toolbar.addWidget(new_pane)
+        toolbar.addSeparator()
+
+        layout_button = QToolButton()
+        layout_button.setText("Diseño")
+        layout_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        from PySide6.QtWidgets import QMenu
+
+        layout_menu = QMenu(layout_button)
+        for mode in LAYOUTS:
+            layout_menu.addAction(self.act_layouts[mode])
+        layout_button.setMenu(layout_menu)
+        toolbar.addWidget(layout_button)
+
+        merge_button = QToolButton()
+        merge_button.setText("⇱ Unir pestañas")
+        merge_button.setToolTip(
+            "Convierte las terminales de todas las pestañas en paneles de esta sesión"
+        )
+        merge_button.clicked.connect(self.merge_tabs_into_current)
+        toolbar.addWidget(merge_button)
+
+        broadcast = QToolButton()
+        broadcast.setText("⇢ Difusión")
+        broadcast.setCheckable(True)
+        broadcast.setToolTip(
+            "Lo que escribas se envía a todos los paneles visibles de la pestaña (Ctrl+Shift+B)"
+        )
+        broadcast.toggled.connect(self._on_broadcast_button)
+        self.broadcast_button = broadcast
+        toolbar.addWidget(broadcast)
+        toolbar.addSeparator()
+
+        restart = QToolButton()
+        restart.setText("↻ Reiniciar")
+        restart.clicked.connect(self.restart_active)
+        toolbar.addWidget(restart)
+
+        files = QToolButton()
+        files.setText("📁 Carpetas")
+        files.setToolTip("Mostrar/ocultar el explorador de carpetas")
+        files.setCheckable(True)
+        files.clicked.connect(self._toggle_file_browser)
+        self.file_button = files
+        toolbar.addWidget(files)
+
+        sudo_button = QToolButton()
+        sudo_button.setText("🔑 sudo")
+        sudo_button.setToolTip("Estrategias para que los agentes usen sudo sin contraseña")
+        sudo_button.clicked.connect(self.open_sudo)
+        toolbar.addWidget(sudo_button)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding, spacer.sizePolicy().verticalPolicy())
+        toolbar.addWidget(spacer)
+
+        settings_button = QToolButton()
+        settings_button.setText("⚙")
+        settings_button.setToolTip("Ajustes")
+        settings_button.clicked.connect(self.open_settings)
+        toolbar.addWidget(settings_button)
+
+    def _build_tabs(self) -> None:
+        self.tabs = QTabWidget(self)
+        self.tabs.setTabsClosable(True)
+        self.tabs.setMovable(True)
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabCloseRequested.connect(self.close_tab_at)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        plus = QToolButton()
+        plus.setText("＋")
+        plus.setToolTip("Nueva pestaña (Ctrl+T)")
+        plus.setFixedSize(26, 26)
+        plus.setAutoRaise(True)
+        plus.clicked.connect(lambda: self.choose_agent(new_tab=True))
+        self.tabs.setCornerWidget(plus, Qt.Corner.TopRightCorner)
+
+        holder = QWidget(self)
+        from PySide6.QtWidgets import QVBoxLayout
+
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(0)
+        holder_layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(holder)
+
+    def _build_file_browser(self) -> None:
+        self.file_dock = QDockWidget("Carpetas", self)
+        self.file_dock.setObjectName("FileBrowserDock")
+        self.file_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self.file_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+        )
+        self.file_browser = FileBrowserWidget(self.settings.start_dir, self.file_dock)
+        self.file_browser.assignRequested.connect(self.assign_directory_to_active)
+        self.file_browser.newPanelRequested.connect(
+            lambda path: self.choose_agent(new_tab=False, cwd_hint=path)
+        )
+        self.file_dock.setWidget(self.file_browser)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
+        self.file_dock.resize(280, self.height())
+        self.file_dock.visibilityChanged.connect(self.file_button.setChecked)
+        self.file_button.setChecked(self.file_dock.isVisible())
+        for menu_action in self.menuBar().actions():
+            if menu_action.text().replace("&", "") == "Ver" and menu_action.menu() is not None:
+                menu_action.menu().addSeparator()
+                menu_action.menu().addAction(self.file_dock.toggleViewAction())
+                break
+
+    def _toggle_file_browser(self, visible: bool) -> None:
+        self.file_dock.setVisible(visible)
+
+    def assign_directory_to_active(self, path: str) -> None:
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if pane is not None:
+            self.assign_directory_to_pane(pane, path)
+
+    def assign_directory_to_pane(self, pane, path: str) -> None:
+        if pane is None or not os.path.isdir(path):
+            return
+        pane.assign_directory(path)
+        self.file_browser.set_root(path)
+        self.statusBar().showMessage(
+            f"{pane.agent.name} → {path} · reiniciando en esa carpeta", 5000
+        )
+
+    def _build_statusbar(self) -> None:
+        self.status_left = QLabel("", self)
+        self.status_right = QLabel("", self)
+        bar = self.statusBar()
+        bar.addWidget(self.status_left, 1)
+        bar.addPermanentWidget(self.status_right)
+
+    def _build_prompt(self) -> None:
+        self.prompt = PromptBar(self)
+        self.prompt.submitted.connect(self._on_prompt)
+        container = self.centralWidget()
+        container.layout().addWidget(self.prompt)
+
+    def _restore_geometry(self) -> None:
+        geometry = (load_session() or {}).get("geometry") if self.settings.restore_session else None
+        if isinstance(geometry, str) and geometry:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ sesión
+    def _restore_or_create_session(self) -> None:
+        tabs = load_session().get("tabs", []) if self.settings.restore_session else []
+        created = False
+        for tab in tabs if isinstance(tabs, list) else []:
+            panes = tab.get("panes") or []
+            if not panes:
+                continue
+            workspace = self.add_workspace(str(tab.get("title") or "Sesión"))
+            workspace.set_layout(str(tab.get("layout") or self.settings.default_layout))
+            for pane in panes:
+                agent = self.config.agent(str(pane.get("agent", "")))
+                if agent is None:
+                    continue
+                workspace.add_pane(agent, str(pane.get("cwd") or self.settings.start_dir), focus=False)
+            if workspace.count():
+                created = True
+                if tab.get("broadcast"):
+                    workspace.set_broadcast(True)
+            else:
+                self._remove_workspace(workspace)
+        if not created:
+            self.new_tab()
+
+    def _workspaces(self):
+        return [self.tabs.widget(i) for i in range(self.tabs.count())]
+
+    def workspace(self) -> WorkspaceWidget | None:
+        widget = self.tabs.currentWidget()
+        return widget if isinstance(widget, WorkspaceWidget) else None
+
+    def add_workspace(self, title: str = "Sesión") -> WorkspaceWidget:
+        workspace = WorkspaceWidget(self.settings)
+        workspace.titleChanged.connect(lambda text, w=workspace: self._on_title_changed(w, text))
+        workspace.activeChanged.connect(self._on_workspace_active)
+        workspace.panesChanged.connect(self._update_status)
+        workspace.agentExited.connect(self._on_agent_exited)
+        workspace.layoutChanged.connect(self._on_layout_changed)
+        workspace.hostKeyRequested.connect(self._enter_host_mode)
+        workspace.userFocusRequested.connect(self._exit_host_mode)
+        workspace.directoryDropped.connect(self.assign_directory_to_pane)
+        index = self.tabs.addTab(workspace, title)
+        self.tabs.setCurrentIndex(index)
+        return workspace
+
+    def _remove_workspace(self, workspace: WorkspaceWidget) -> None:
+        index = self.tabs.indexOf(workspace)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        workspace.shutdown()
+        workspace.setParent(None)
+        workspace.deleteLater()
+
+    def new_tab(self, agent: Agent | None = None, cwd: str = "") -> WorkspaceWidget:
+        workspace = self.add_workspace("Sesión")
+        agent = agent or self.default_agent()
+        workspace.add_pane(agent, cwd or self.settings.start_dir)
+        self._update_status()
+        return workspace
+
+    def default_agent(self) -> Agent:
+        if self.settings.default_agent:
+            found = self.config.agent(self.settings.default_agent)
+            if found is not None:
+                return found
+        return pick_default_agent(self.config.agents)
+
+    def choose_agent(self, *, new_tab: bool, cwd_hint: str = "") -> None:
+        workspace = self.workspace()
+        hint = cwd_hint or (
+            workspace.active_pane().shell_cwd() if workspace and workspace.active_pane() else ""
+        )
+        dialog = AgentChooserDialog(self.config.agents, self.settings, self, cwd_hint=hint)
+        if dialog.exec() != AgentChooserDialog.DialogCode.Accepted:
+            return
+        agent = dialog.chosen_agent()
+        cwd = dialog.chosen_cwd()
+        make_new_tab = new_tab or dialog.wants_new_tab()
+        if make_new_tab or self.workspace() is None:
+            workspace = self.new_tab(agent, cwd)
+        else:
+            workspace.add_pane(agent, cwd)
+        self._update_status()
+
+    def close_pane(self) -> None:
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if workspace is not None and pane is not None:
+            workspace.close_pane(pane)
+
+    def close_tab(self) -> None:
+        self.close_tab_at(self.tabs.currentIndex())
+
+    def close_tab_at(self, index: int) -> None:
+        workspace = self.tabs.widget(index)
+        if isinstance(workspace, WorkspaceWidget):
+            self._remove_workspace(workspace)
+        if self.tabs.count() == 0:
+            self.new_tab()
+
+    def merge_tabs_into_current(self) -> None:
+        """Convierte las pestañas en paneles de la pestaña actual.
+
+        Es el puente entre los dos conceptos que suelen confundirse: una pestaña
+        es una sesión independiente; un panel es una terminal que se puede ver
+        junto a otra. Los procesos siguen vivos durante el traslado.
+        """
+        target = self.workspace()
+        if target is None or self.tabs.count() < 2:
+            return
+
+        current_index = self.tabs.currentIndex()
+        others = [
+            self.tabs.widget(index)
+            for index in range(self.tabs.count())
+            if index != current_index
+        ]
+        moved = 0
+        for workspace in others:
+            if not isinstance(workspace, WorkspaceWidget):
+                continue
+            panes = workspace.detach_panes()
+            moved += len(panes)
+            target.adopt_panes(panes, focus=False)
+            index = self.tabs.indexOf(workspace)
+            if index >= 0:
+                self.tabs.removeTab(index)
+            workspace.setParent(None)
+            workspace.deleteLater()
+
+        if moved:
+            target.title = "Mosaico"
+            target.set_layout("all" if target.count() > 2 else "2v")
+            self._update_status()
+            self.statusBar().showMessage(
+                f"{moved} terminal(es) añadida(s) al mosaico. Ahora usa Diseño para elegir 1, 2 o todas.",
+                6000,
+            )
+
+    def rename_tab(self) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            return
+        from PySide6.QtWidgets import QInputDialog
+
+        title, ok = QInputDialog.getText(self, "Renombrar pestaña", "Nombre:", text=workspace.title)
+        if ok and title.strip():
+            workspace.title = title.strip()
+            self._on_title_changed(workspace, title.strip())
+
+    def _cycle_tab(self, step: int) -> None:
+        count = self.tabs.count()
+        if count:
+            self.tabs.setCurrentIndex((self.tabs.currentIndex() + step) % count)
+
+    def _on_tab_changed(self, _index: int) -> None:
+        workspace = self.workspace()
+        if not self._host_mode:
+            self._set_app_shortcuts(False)
+        if workspace is not None:
+            if not self._host_mode:
+                workspace.focus_terminal()
+            else:
+                self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
+            for mode, action in self.act_layouts.items():
+                action.setChecked(mode == workspace.layout_mode)
+            self.broadcast_button.setChecked(workspace.broadcast)
+            self.act_broadcast.setChecked(workspace.broadcast)
+        self._update_status()
+
+    def _on_workspace_active(self, _pane) -> None:
+        if not self._host_mode:
+            self._set_app_shortcuts(False)
+        self._update_status()
+
+    def _exit_host_mode(self, _pane) -> None:
+        """El usuario hizo clic en una terminal: devolverle el teclado."""
+        self._host_mode = False
+        self._set_app_shortcuts(False)
+        self.prompt.set_host_mode(False)
+        self._update_status()
+
+    def _enter_host_mode(self, pane) -> None:
+        """VirtualBox-style Host Key: libera el foco de la TUI."""
+        self._host_mode = True
+        self._set_app_shortcuts(True)
+        self.prompt.set_host_mode(True)
+        self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.statusBar().showMessage(
+            "MODO RNCli: atajos activos. Ctrl+W, Ctrl+Shift+T, Alt+1… funcionan aquí. "
+            "Haz clic en una terminal para escribir.",
+            8000,
+        )
+
+    def _on_title_changed(self, workspace: WorkspaceWidget, text: str) -> None:
+        index = self.tabs.indexOf(workspace)
+        if index >= 0:
+            self.tabs.setTabText(index, text)
+            agents = ", ".join(pane.agent.name for pane in workspace.panes())
+            self.tabs.setTabToolTip(index, f"{text}\n{agents}")
+        self._update_title()
+
+    def _update_title(self) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            self.setWindowTitle(APP_NAME)
+            return
+        extra = f"  ·  {workspace.count()} paneles" if workspace.count() > 1 else ""
+        self.setWindowTitle(f"{APP_NAME} — {workspace.title}{extra}")
+
+    # ------------------------------------------------------------------ vistas
+    def set_layout(self, mode: str) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            return
+        # Si el usuario creó agentes como pestañas y ahora pide un mosaico,
+        # ofrecer la conversión explícita en vez de dejarle una vista que parece
+        # no funcionar.
+        if mode != "1" and workspace.count() <= 1 and self.tabs.count() > 1:
+            answer = QMessageBox.question(
+                self,
+                "Ver terminales juntas",
+                "Tienes terminales en pestañas separadas. ¿Quieres convertirlas en "
+                "paneles de esta sesión para verlas juntas?\n\n"
+                "Los agentes seguirán ejecutándose; solo cambia la organización visual.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self.merge_tabs_into_current()
+                workspace = self.workspace()
+        workspace.set_layout(mode)
+        self.act_layouts[mode].setChecked(True)
+        self._update_status()
+
+    def _on_layout_changed(self, mode: str) -> None:
+        action = self.act_layouts.get(mode)
+        if action is not None and not action.isChecked():
+            action.setChecked(True)
+        self._update_status()
+
+    def _focus(self, step: int) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            return
+        workspace.focus_next() if step > 0 else workspace.focus_prev()
+
+    def maximize_active(self) -> None:
+        """Alterna entre ver solo el panel activo y verlos todos."""
+        if self.act_layouts["1"].isChecked():
+            self.set_layout("all")
+        else:
+            self.set_layout("1")
+
+    def toggle_broadcast(self) -> None:
+        self.set_broadcast(self.act_broadcast.isChecked())
+
+    def _on_broadcast_button(self, checked: bool) -> None:
+        if self.act_broadcast.isChecked() != checked:
+            self.act_broadcast.setChecked(checked)
+        self.set_broadcast(checked)
+
+    def set_broadcast(self, enabled: bool) -> None:
+        workspace = self.workspace()
+        if workspace is not None:
+            workspace.set_broadcast(enabled)
+        self.broadcast_button.setChecked(enabled)
+        self.act_broadcast.setChecked(enabled)
+        self._update_status()
+
+    def restart_active(self) -> None:
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if pane is not None:
+            pane.restart()
+            self._update_status()
+
+    def zoom(self, delta: int = 0, *, reset: bool = False) -> None:
+        base = self.config.settings.font_size
+        if reset:
+            size = base
+        else:
+            size = max(6, min(40, self.settings.font_size + delta))
+        if size == self.settings.font_size and not reset:
+            return
+        self.settings.font_size = size
+        self._apply_settings_to_workspaces()
+        self.config.save()
+
+    def toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    def _terminal_call(self, method: str) -> None:
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if pane is not None and pane.terminal is not None:
+            getattr(pane.terminal, method)()
+
+    def focus_prompt(self) -> None:
+        self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    # ------------------------------------------------------------------ ajustes
+    def apply_theme(self) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(app_stylesheet(self.settings.theme))
+
+    def _apply_settings_to_workspaces(self) -> None:
+        for workspace in self._workspaces():
+            if isinstance(workspace, WorkspaceWidget):
+                workspace.apply_settings(self.settings, self.settings.theme)
+
+    def open_settings(self) -> None:
+        dialog = SettingsDialog(self.settings, self.config.agents, self)
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+        self.settings = dialog.result_settings(self.settings)
+        self.config.settings = self.settings
+        self.config.save()
+        self.apply_theme()
+        self._apply_settings_to_workspaces()
+        self._update_status()
+
+    def open_config(self) -> None:
+        from .config import CONFIG_PATH
+
+        if not CONFIG_PATH.exists():
+            self.config.save()
+        QApplication.clipboard().setText(str(CONFIG_PATH))
+        QMessageBox.information(
+            self,
+            "config.json",
+            f"Ruta copiada al portapapeles:\n\n{CONFIG_PATH}\n\n"
+            "Edítala para añadir agentes, comandos y variables de entorno (por ejemplo claves de API). "
+            "Los cambios se aplican al reiniciar RNCli.",
+        )
+
+    def open_sudo(self) -> None:
+        SudoDialog(self).exec()
+
+    def open_help(self) -> None:
+        ShortcutsDialog(self).exec()
+
+    def open_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"Acerca de {APP_NAME}",
+            f"<h3>{APP_NAME} {__version__}</h3>"
+            "<p>Multiplexor de terminales para agentes de IA.</p>"
+            "<p>Lanza opencode, pi, cursor-agent, claude o gemini en paralelo, "
+            "organízalos en pestañas y diseños (1, 2, 4, 6 o todos visibles) y "
+            "muéstrales la misma orden con la difusión activada.</p>"
+            "<p>Cada panel es una terminal real (pty + VT100 con pyte), así que las "
+            "TUI funcionan tal cual.</p>"
+            "<p style='color:gray'>Iconos: el tema del escritorio · Atajos: F1</p>",
+        )
+
+    # ------------------------------------------------------------------ eventos
+    def _on_agent_exited(self, pane) -> None:
+        self.statusBar().showMessage(
+            f"«{pane.agent.name}» terminó (código {pane.session.returncode if pane.session else '?'}). "
+            "Pulsa Enter en su panel o Ctrl+Shift+R para reiniciarlo.",
+            8000,
+        )
+        self._update_status()
+
+    def _on_prompt(self, text: str, to_all: bool) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            return
+        if to_all:
+            workspace.send_to_all(text)
+            self.statusBar().showMessage("Enviado a todos los paneles.", 3000)
+        else:
+            pane = workspace.active_pane()
+            if pane is not None:
+                pane.send(text.replace("\n", "\r").encode("utf-8", "replace"))
+                if not pane.is_alive():
+                    self.statusBar().showMessage(
+                        "El panel no está vivo; pulsa Enter en la terminal para reiniciar.", 4000
+                    )
+
+    def _update_status(self) -> None:
+        workspace = self.workspace()
+        if workspace is None:
+            self.status_left.setText("Sin sesión")
+            self.status_right.setText("")
+            return
+        pane = workspace.active_pane()
+        if pane is None:
+            self.status_left.setText("Pestaña vacía — Ctrl+Shift+T para añadir un panel")
+        else:
+            state = "activo" if pane.is_alive() else "finalizado"
+            self.status_left.setText(
+                f"{pane.agent.emoji} {pane.agent.name} · {pane.shell_cwd()} · {state}"
+            )
+        layout = LAYOUT_LABELS.get(workspace.layout_mode, workspace.layout_mode)
+        broadcast = " · ⇢ difusión" if workspace.broadcast else ""
+        self.status_right.setText(
+            f"{workspace.count()} panel(es) · {layout}{broadcast} · Ctrl+Shift+T nuevo panel"
+        )
+        self._update_title()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        alive = sum(
+            1
+            for workspace in self._workspaces()
+            if isinstance(workspace, WorkspaceWidget)
+            for pane in workspace.panes()
+            if pane.is_alive()
+        )
+        if self.settings.confirm_exit and alive:
+            answer = QMessageBox.question(
+                self,
+                "Cerrar RNCli",
+                f"Hay {alive} agente(s) en marcha. ¿Cerrar de todas formas?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+
+        if self.settings.restore_session:
+            tabs = [workspace.state() for workspace in self._workspaces()]
+            save_session(tabs, bytes(self.saveGeometry().toBase64()).decode())
+        self._shutdown()
+        event.accept()
+
+    def _shutdown(self) -> None:
+        if getattr(self, "_shutdown_done", False):
+            return
+        self._shutdown_done = True
+        for workspace in self._workspaces():
+            if isinstance(workspace, WorkspaceWidget):
+                workspace.shutdown()
+        self.config.save()
+
+    def shutdown(self) -> None:
+        """Cierre ordenado (lo usa también el manejador de señales)."""
+        self._shutdown()

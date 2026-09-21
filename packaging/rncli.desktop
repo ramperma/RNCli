@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=RNCli
+GenericName=Terminal para agentes de IA
+Comment=Lanza opencode, pi, cursor-agent, claude y gemini en paralelo con diseños y difusión
+Exec=__EXEC__
+Icon=__ICON__
+Terminal=false
+Categories=Development;TerminalEmulator;
+Keywords=terminal;ai;agente;opencode;pi;cursor;claude;gemini;
+StartupNotify=true
+StartupWMClass=rncli

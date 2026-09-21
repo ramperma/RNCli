@@ -1,0 +1,25 @@
+[project]
+name = "rncli"
+version = "0.1.0"
+description = "Multiplexor de terminales para agentes de IA (opencode, pi, cursor, claude, gemini)"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.6", "pyte>=0.8.2"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "RET", "SIM", "PIE", "RUF"]
+ignore = [
+    "E501",   # el límite lo marca el formateador, no hace falta partirlo todo
+    "N803", "N806",  # nombres de argumentos exigidos por la API de Qt
+    "N815",   # señales de Qt en camelCase (closeRequested, dataReceived...)
+    "RUF001", "RUF002", "RUF003",  # signos tipográficos intencionados (×, ＋, ·)
+    "SIM105", # try/except pass es más legible que contextlib.suppress aquí
+    "SIM108", # ternario forzado: preferimos if/else explícito
+    "RET504", # asignar antes de devolver ayuda a leer
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F841", "B011"]
