@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QByteArray, QEvent, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QDockWidget,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
+    QSizePolicy,
     QTabWidget,
     QToolBar,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -29,8 +34,8 @@ from .dialogs import (
     SudoDialog,
 )
 from .file_browser import FileBrowserWidget
-from .layouts import LAYOUT_LABELS, WorkspaceWidget
-from .terminal import TerminalWidget
+from .layouts import LAYOUT_LABELS, LAYOUT_SHORT, WorkspaceWidget
+from .terminal import TerminalWidget, is_host_key, tab_sequence
 from .theme import app_stylesheet
 
 
@@ -41,13 +46,8 @@ class PromptBar(QLineEdit):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._normal_placeholder = (
-            "Escribe aquí y pulsa Enter para enviarlo al panel activo "
-            "(Ctrl+Enter = a todos los paneles)"
-        )
-        self._host_placeholder = (
-            "MODO RNCli · atajos activos · haz clic en una terminal para volver a escribir"
-        )
+        self._normal_placeholder = "Escribe y pulsa Enter para enviarlo al panel activo"
+        self._host_placeholder = "MODO RNCli · atajos del chasis activos · Host Key para volver"
         self.setPlaceholderText(
             self._normal_placeholder
         )
@@ -103,28 +103,34 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        """Reenvía los atajos de RNCli cuando el foco está liberado."""
-        if event.type() == QEvent.Type.KeyPress:
-            focus = QApplication.focusWidget()
-            is_reverse_tab = (
-                event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
-                and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-                and not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            )
-            if is_reverse_tab and isinstance(focus, TerminalWidget) and not self._host_mode:
-                # Qt convierte Shift+Tab en Backtab y suele mover el foco antes
-                # de que la TUI vea la tecla. Entregar el protocolo VT aquí
-                # evita que el foco salte entre terminales.
-                focus.send_special(b"\x1b[Z")
-                event.accept()
-                return True
-        if self._host_mode and event.type() == QEvent.Type.KeyPress:
+        """Tab al agente; resto al terminal seleccionado; Host Key al chasis."""
+        if event.type() != QEvent.Type.KeyPress:
+            return super().eventFilter(watched, event)
+
+        focus = QApplication.focusWidget()
+        data = tab_sequence(event)
+        if data is not None and isinstance(focus, TerminalWidget) and not self._host_mode:
+            # Qt usa Tab/Backtab para el foco. cursor-agent (y Pi con Shift+Tab)
+            # necesitan esas teclas; el resto sigue yendo al terminal seleccionado.
+            focus.send_special(data)
+            event.accept()
+            return True
+        if self._host_mode and is_host_key(event, self.settings):
+            self._return_keyboard_to_terminal()
+            event.accept()
+            return True
+        if self._host_mode:
             action = self._host_action(event)
             if action is not None:
                 action.trigger()
                 event.accept()
                 return True
         return super().eventFilter(watched, event)
+
+    def _host_key_hint(self) -> str:
+        if self.settings.escape_key == "host":
+            return "Ctrl derecho o Escape"
+        return "Ctrl derecho"
 
     def _host_action(self, event) -> QAction | None:
         key = event.key()
@@ -252,6 +258,26 @@ class MainWindow(QMainWindow):
 
         self._build_menus()
 
+    def _chrome_button(
+        self,
+        text: str,
+        tooltip: str,
+        slot=None,
+        *,
+        checkable: bool = False,
+        object_name: str = "ChromeButton",
+    ) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName(object_name)
+        button.setText(text)
+        button.setToolTip(tooltip)
+        button.setCheckable(checkable)
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setAutoRaise(False)
+        if slot is not None:
+            button.clicked.connect(slot)
+        return button
+
     def _build_menus(self) -> None:
         bar = self.menuBar()
 
@@ -262,14 +288,15 @@ class MainWindow(QMainWindow):
         session_menu.addAction(self.act_close_pane)
         session_menu.addAction(self.act_close_tab)
         session_menu.addAction(self.act_rename_tab)
-        merge_tabs = QAction("Convertir todas las pestañas en paneles", self)
-        merge_tabs.setToolTip("Mueve sus terminales a la pestaña actual para poder verlas juntas")
-        merge_tabs.triggered.connect(self.merge_tabs_into_current)
-        self.act_merge_tabs = merge_tabs
-        session_menu.addAction(merge_tabs)
         session_menu.addSeparator()
         session_menu.addAction(self.act_next_tab)
         session_menu.addAction(self.act_prev_tab)
+        session_menu.addSeparator()
+        self.act_merge_tabs = session_menu.addAction("Convertir pestañas en paneles")
+        self.act_merge_tabs.setToolTip(
+            "Mueve sus terminales a la pestaña actual para poder verlas juntas"
+        )
+        self.act_merge_tabs.triggered.connect(self.merge_tabs_into_current)
         session_menu.addSeparator()
         session_menu.addAction(self.act_quit)
 
@@ -318,98 +345,107 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Principal", self)
         toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setIconSize(QSize(16, 16))
         self.addToolBar(toolbar)
 
-        new_tab = QToolButton()
-        new_tab.setText("＋ Pestaña")
-        new_tab.setToolTip("Nueva pestaña con el agente que elijas (Ctrl+T)")
-        new_tab.clicked.connect(lambda: self.choose_agent(new_tab=True))
-        new_pane = QToolButton()
-        new_pane.setText("＋ Panel")
-        new_pane.setToolTip("Nuevo panel en la pestaña actual (Ctrl+Shift+T)")
-        new_pane.clicked.connect(lambda: self.choose_agent(new_tab=False))
-        toolbar.addWidget(new_tab)
+        new_pane = self._chrome_button(
+            "+ Panel",
+            "Nuevo panel en esta pestaña (Ctrl+Shift+T)",
+            lambda: self.choose_agent(new_tab=False),
+        )
+        new_tab = self._chrome_button(
+            "Pestaña",
+            "Nueva pestaña (Ctrl+T)",
+            lambda: self.choose_agent(new_tab=True),
+        )
         toolbar.addWidget(new_pane)
+        toolbar.addWidget(new_tab)
         toolbar.addSeparator()
 
-        layout_button = QToolButton()
-        layout_button.setText("Diseño")
-        layout_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        from PySide6.QtWidgets import QMenu
+        caption = QLabel("DISEÑO")
+        caption.setObjectName("LayoutCaption")
+        toolbar.addWidget(caption)
 
-        layout_menu = QMenu(layout_button)
+        segment = QWidget()
+        segment.setObjectName("LayoutSegment")
+        row = QHBoxLayout(segment)
+        row.setContentsMargins(3, 3, 3, 3)
+        row.setSpacing(2)
+        self.layout_button_group = QButtonGroup(self)
+        self.layout_button_group.setExclusive(True)
+        self.layout_buttons: dict[str, QToolButton] = {}
         for mode in LAYOUTS:
-            layout_menu.addAction(self.act_layouts[mode])
-        layout_button.setMenu(layout_menu)
-        toolbar.addWidget(layout_button)
+            button = QToolButton()
+            button.setObjectName("SegmentButton")
+            button.setText(LAYOUT_SHORT[mode])
+            shortcut = self.act_layouts[mode].property("rncliShortcut") or ""
+            button.setToolTip(f"{LAYOUT_LABELS[mode]}  ({shortcut})")
+            button.setCheckable(True)
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.clicked.connect(lambda _=False, m=mode: self.set_layout(m))
+            self.layout_button_group.addButton(button)
+            self.layout_buttons[mode] = button
+            row.addWidget(button)
+        toolbar.addWidget(segment)
 
-        merge_button = QToolButton()
-        merge_button.setText("⇱ Unir pestañas")
-        merge_button.setToolTip(
-            "Convierte las terminales de todas las pestañas en paneles de esta sesión"
-        )
-        merge_button.clicked.connect(self.merge_tabs_into_current)
-        toolbar.addWidget(merge_button)
-
-        broadcast = QToolButton()
-        broadcast.setText("⇢ Difusión")
-        broadcast.setCheckable(True)
-        broadcast.setToolTip(
-            "Lo que escribas se envía a todos los paneles visibles de la pestaña (Ctrl+Shift+B)"
+        broadcast = self._chrome_button(
+            "Difusión",
+            "Lo que escribas se envía a todos los paneles de la pestaña (Ctrl+Shift+B)",
+            checkable=True,
         )
         broadcast.toggled.connect(self._on_broadcast_button)
         self.broadcast_button = broadcast
         toolbar.addWidget(broadcast)
-        toolbar.addSeparator()
 
-        restart = QToolButton()
-        restart.setText("↻ Reiniciar")
-        restart.clicked.connect(self.restart_active)
-        toolbar.addWidget(restart)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        toolbar.addWidget(spacer)
 
-        files = QToolButton()
-        files.setText("📁 Carpetas")
-        files.setToolTip("Mostrar/ocultar el explorador de carpetas")
-        files.setCheckable(True)
-        files.clicked.connect(self._toggle_file_browser)
+        files = self._chrome_button(
+            "Explorador",
+            "Mostrar u ocultar el explorador de archivos",
+            self._toggle_file_browser,
+            checkable=True,
+        )
         self.file_button = files
         toolbar.addWidget(files)
 
-        sudo_button = QToolButton()
-        sudo_button.setText("🔑 sudo")
-        sudo_button.setToolTip("Estrategias para que los agentes usen sudo sin contraseña")
-        sudo_button.clicked.connect(self.open_sudo)
-        toolbar.addWidget(sudo_button)
-
-        spacer = QWidget()
-        spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding, spacer.sizePolicy().verticalPolicy())
-        toolbar.addWidget(spacer)
-
-        settings_button = QToolButton()
-        settings_button.setText("⚙")
-        settings_button.setToolTip("Ajustes")
-        settings_button.clicked.connect(self.open_settings)
+        settings_button = self._chrome_button("Ajustes", "Ajustes de RNCli", self.open_settings)
         toolbar.addWidget(settings_button)
+
+        more = self._chrome_button("···", "Más acciones")
+        more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more_menu = QMenu(more)
+        more_menu.addAction(self.act_merge_tabs)
+        more_menu.addAction(self.act_restart)
+        more_menu.addSeparator()
+        more_menu.addAction(self.act_sudo)
+        more_menu.addAction(self.act_help)
+        more.setMenu(more_menu)
+        toolbar.addWidget(more)
 
     def _build_tabs(self) -> None:
         self.tabs = QTabWidget(self)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.tabCloseRequested.connect(self.close_tab_at)
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         plus = QToolButton()
+        plus.setObjectName("IconButton")
         plus.setText("＋")
         plus.setToolTip("Nueva pestaña (Ctrl+T)")
-        plus.setFixedSize(26, 26)
+        plus.setFixedSize(28, 28)
         plus.setAutoRaise(True)
+        plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         plus.clicked.connect(lambda: self.choose_agent(new_tab=True))
         self.tabs.setCornerWidget(plus, Qt.Corner.TopRightCorner)
 
         holder = QWidget(self)
-        from PySide6.QtWidgets import QVBoxLayout
-
         holder_layout = QVBoxLayout(holder)
         holder_layout.setContentsMargins(0, 0, 0, 0)
         holder_layout.setSpacing(0)
@@ -417,7 +453,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(holder)
 
     def _build_file_browser(self) -> None:
-        self.file_dock = QDockWidget("Carpetas", self)
+        self.file_dock = QDockWidget("Explorador", self)
         self.file_dock.setObjectName("FileBrowserDock")
         self.file_dock.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
@@ -427,24 +463,54 @@ class MainWindow(QMainWindow):
             | QDockWidget.DockWidgetFeature.DockWidgetFloatable
             | QDockWidget.DockWidgetFeature.DockWidgetClosable
         )
-        self.file_browser = FileBrowserWidget(self.settings.start_dir, self.file_dock)
+        self.file_browser = FileBrowserWidget(
+            self.settings.start_dir,
+            self.file_dock,
+            show_hidden=self.settings.show_hidden_files,
+        )
         self.file_browser.assignRequested.connect(self.assign_directory_to_active)
+        self.file_browser.filesRequested.connect(self.insert_files_into_active)
         self.file_browser.newPanelRequested.connect(
             lambda path: self.choose_agent(new_tab=False, cwd_hint=path)
         )
+        self.file_browser.showHiddenChanged.connect(self._on_show_hidden_changed)
         self.file_dock.setWidget(self.file_browser)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
+        self.file_dock.setMinimumWidth(260)
         self.file_dock.resize(280, self.height())
         self.file_dock.visibilityChanged.connect(self.file_button.setChecked)
         self.file_button.setChecked(self.file_dock.isVisible())
+        self.act_show_hidden = QAction("Mostrar archivos ocultos", self)
+        self.act_show_hidden.setCheckable(True)
+        self.act_show_hidden.setChecked(self.settings.show_hidden_files)
+        self.act_show_hidden.setToolTip(
+            "Archivos y carpetas que empiezan por «.» · Ctrl+H con el explorador enfocado"
+        )
+        self.act_show_hidden.triggered.connect(self._on_show_hidden_action)
         for menu_action in self.menuBar().actions():
             if menu_action.text().replace("&", "") == "Ver" and menu_action.menu() is not None:
                 menu_action.menu().addSeparator()
                 menu_action.menu().addAction(self.file_dock.toggleViewAction())
+                menu_action.menu().addAction(self.act_show_hidden)
                 break
 
     def _toggle_file_browser(self, visible: bool) -> None:
         self.file_dock.setVisible(visible)
+
+    def _on_show_hidden_action(self, checked: bool) -> None:
+        self.file_browser.set_show_hidden(bool(checked))
+
+    def _on_show_hidden_changed(self, show: bool) -> None:
+        show = bool(show)
+        if self.act_show_hidden.isChecked() != show:
+            self.act_show_hidden.blockSignals(True)
+            self.act_show_hidden.setChecked(show)
+            self.act_show_hidden.blockSignals(False)
+        if self.settings.show_hidden_files == show:
+            return
+        self.settings.show_hidden_files = show
+        self.config.settings = self.settings
+        self.config.save()
 
     def assign_directory_to_active(self, path: str) -> None:
         workspace = self.workspace()
@@ -461,6 +527,23 @@ class MainWindow(QMainWindow):
             f"{pane.agent.name} → {path} · reiniciando en esa carpeta", 5000
         )
 
+    def insert_files_into_active(self, paths: list) -> None:
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if pane is None or pane.terminal is None:
+            return
+        pane.terminal.insert_paths(list(paths))
+        pane.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._announce_files(pane, list(paths))
+
+    def _on_files_dropped(self, pane, paths: list) -> None:
+        self._announce_files(pane, list(paths))
+
+    def _announce_files(self, pane, paths: list) -> None:
+        names = ", ".join(os.path.basename(path) for path in paths[:4])
+        extra = f" (+{len(paths) - 4})" if len(paths) > 4 else ""
+        self.statusBar().showMessage(f"{pane.agent.name} ← {names}{extra}", 5000)
+
     def _build_statusbar(self) -> None:
         self.status_left = QLabel("", self)
         self.status_right = QLabel("", self)
@@ -469,10 +552,29 @@ class MainWindow(QMainWindow):
         bar.addPermanentWidget(self.status_right)
 
     def _build_prompt(self) -> None:
-        self.prompt = PromptBar(self)
+        container = QWidget(self)
+        container.setObjectName("PromptContainer")
+        container.setFixedHeight(52)
+        self.prompt_container = container
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(14, 8, 14, 8)
+        layout.setSpacing(10)
+
+        self.prompt_icon = QLabel("❯", container)
+        self.prompt_icon.setObjectName("PromptIcon")
+        layout.addWidget(self.prompt_icon)
+
+        self.prompt = PromptBar(container)
+        self.prompt.setObjectName("PromptBar")
         self.prompt.submitted.connect(self._on_prompt)
-        container = self.centralWidget()
-        container.layout().addWidget(self.prompt)
+        layout.addWidget(self.prompt, 1)
+
+        self.prompt_hint = QLabel("Enter  ·  panel activo", container)
+        self.prompt_hint.setObjectName("PromptHint")
+        layout.addWidget(self.prompt_hint)
+
+        holder = self.centralWidget()
+        holder.layout().addWidget(container)
 
     def _restore_geometry(self) -> None:
         geometry = (load_session() or {}).get("geometry") if self.settings.restore_session else None
@@ -523,6 +625,7 @@ class MainWindow(QMainWindow):
         workspace.hostKeyRequested.connect(self._enter_host_mode)
         workspace.userFocusRequested.connect(self._exit_host_mode)
         workspace.directoryDropped.connect(self.assign_directory_to_pane)
+        workspace.filesDropped.connect(self._on_files_dropped)
         index = self.tabs.addTab(workspace, title)
         self.tabs.setCurrentIndex(index)
         return workspace
@@ -648,7 +751,9 @@ class MainWindow(QMainWindow):
                 self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
             for mode, action in self.act_layouts.items():
                 action.setChecked(mode == workspace.layout_mode)
+            self.broadcast_button.blockSignals(True)
             self.broadcast_button.setChecked(workspace.broadcast)
+            self.broadcast_button.blockSignals(False)
             self.act_broadcast.setChecked(workspace.broadcast)
         self._update_status()
 
@@ -661,18 +766,27 @@ class MainWindow(QMainWindow):
         """El usuario hizo clic en una terminal: devolverle el teclado."""
         self._host_mode = False
         self._set_app_shortcuts(False)
-        self.prompt.set_host_mode(False)
+        self._set_prompt_host_mode(False)
         self._update_status()
+
+    def _return_keyboard_to_terminal(self) -> None:
+        """Host Key otra vez: sale de MODO RNCli y escribe en el panel seleccionado."""
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        self._exit_host_mode(pane)
+        if pane is not None and pane.terminal is not None:
+            pane.terminal.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _enter_host_mode(self, pane) -> None:
         """VirtualBox-style Host Key: libera el foco de la TUI."""
         self._host_mode = True
         self._set_app_shortcuts(True)
-        self.prompt.set_host_mode(True)
+        self._set_prompt_host_mode(True)
         self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        hint = self._host_key_hint()
         self.statusBar().showMessage(
             "MODO RNCli: atajos activos. Ctrl+W, Ctrl+Shift+T, Alt+1… funcionan aquí. "
-            "Haz clic en una terminal para escribir.",
+            f"Haz clic en una terminal o pulsa {hint} para escribir.",
             8000,
         )
 
@@ -748,7 +862,9 @@ class MainWindow(QMainWindow):
         workspace = self.workspace()
         if workspace is not None:
             workspace.set_broadcast(enabled)
+        self.broadcast_button.blockSignals(True)
         self.broadcast_button.setChecked(enabled)
+        self.broadcast_button.blockSignals(False)
         self.act_broadcast.setChecked(enabled)
         self._update_status()
 
@@ -786,10 +902,41 @@ class MainWindow(QMainWindow):
     def focus_prompt(self) -> None:
         self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
+    def _set_prompt_host_mode(self, enabled: bool) -> None:
+        self.prompt.set_host_mode(enabled)
+        self.prompt_container.setProperty("hostMode", bool(enabled))
+        self.prompt_container.style().unpolish(self.prompt_container)
+        self.prompt_container.style().polish(self.prompt_container)
+        self.prompt_container.update()
+        self._update_prompt_hint()
+
+    def _sync_layout_buttons(self) -> None:
+        workspace = self.workspace()
+        mode = workspace.layout_mode if workspace is not None else "1"
+        for key, button in self.layout_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(key == mode)
+            button.blockSignals(False)
+
+    def _update_prompt_hint(self) -> None:
+        if self._host_mode:
+            self.prompt_hint.setText(f"{self._host_key_hint()}  ·  salir")
+            return
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        if pane is None:
+            self.prompt_hint.setText("Enter  ·  enviar")
+            return
+        if workspace is not None and workspace.broadcast:
+            self.prompt_hint.setText("Enter  ·  todos")
+        else:
+            self.prompt_hint.setText(f"Enter  ·  {pane.agent.name}")
+
     # ------------------------------------------------------------------ ajustes
     def apply_theme(self) -> None:
         app = QApplication.instance()
         if app is not None:
+            app.setStyle("Fusion")
             app.setStyleSheet(app_stylesheet(self.settings.theme))
 
     def _apply_settings_to_workspaces(self) -> None:
@@ -806,6 +953,7 @@ class MainWindow(QMainWindow):
         self.config.save()
         self.apply_theme()
         self._apply_settings_to_workspaces()
+        self.file_browser.set_show_hidden(self.settings.show_hidden_files)
         self._update_status()
 
     def open_config(self) -> None:
@@ -823,7 +971,53 @@ class MainWindow(QMainWindow):
         )
 
     def open_sudo(self) -> None:
-        SudoDialog(self).exec()
+        dialog = SudoDialog(self)
+        dialog.sendRequested.connect(self._run_sudo_bash)
+        dialog.exec()
+
+    def _run_sudo_bash(self, command: str) -> None:
+        """Pega el comando de sudo en un panel Bash de esta ventana."""
+        command = (command or "").strip()
+        if not command:
+            return
+        workspace = self.workspace()
+        if workspace is None:
+            workspace = self.new_tab()
+        pane = next((item for item in workspace.panes() if item.agent.id == "shell"), None)
+        if pane is None:
+            agent = self.config.agent("shell")
+            if agent is None:
+                from .agents import Agent
+
+                agent = Agent(id="shell", name="Bash", command=["bash", "-l"])
+            pane = workspace.add_pane(agent, self.settings.start_dir)
+            if workspace.count() > 1 and workspace.layout_mode == "1":
+                workspace.set_layout("2v")
+            self.statusBar().showMessage(
+                "Abriendo un Bash. El comando de sudo se pega en un momento…", 6000
+            )
+            QTimer.singleShot(900, lambda p=pane, c=command: self._send_bash_command(p, c))
+            return
+        workspace.focus_pane(pane)
+        self._send_bash_command(pane, command)
+
+    def _send_bash_command(self, pane, command: str) -> None:
+        if pane is None or pane.session is None or not pane.is_alive():
+            self.statusBar().showMessage(
+                "El Bash aún no está listo. Copia el comando y pégalo cuando veas el prompt.",
+                7000,
+            )
+            return
+        payload = command.replace("\n", "\r")
+        if not payload.endswith("\r"):
+            payload += "\r"
+        pane.send(payload.encode("utf-8", "replace"))
+        if pane.terminal is not None:
+            pane.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.statusBar().showMessage(
+            f"{pane.agent.name}: comando de sudo enviado. Escribe la contraseña si la pide.",
+            8000,
+        )
 
     def open_help(self) -> None:
         ShortcutsDialog(self).exec()
@@ -869,23 +1063,24 @@ class MainWindow(QMainWindow):
 
     def _update_status(self) -> None:
         workspace = self.workspace()
+        self._sync_layout_buttons()
+        self._update_prompt_hint()
         if workspace is None:
             self.status_left.setText("Sin sesión")
             self.status_right.setText("")
             return
         pane = workspace.active_pane()
         if pane is None:
-            self.status_left.setText("Pestaña vacía — Ctrl+Shift+T para añadir un panel")
+            left = "Pestaña vacía  ·  Ctrl+Shift+T añade un panel"
         else:
             state = "activo" if pane.is_alive() else "finalizado"
-            self.status_left.setText(
-                f"{pane.agent.emoji} {pane.agent.name} · {pane.shell_cwd()} · {state}"
-            )
+            left = f"{pane.agent.emoji}  {pane.agent.name}  ·  {pane.shell_cwd()}  ·  {state}"
+        if self._host_mode:
+            left = f"MODO RNCli  ·  {left}"
+        self.status_left.setText(left)
         layout = LAYOUT_LABELS.get(workspace.layout_mode, workspace.layout_mode)
-        broadcast = " · ⇢ difusión" if workspace.broadcast else ""
-        self.status_right.setText(
-            f"{workspace.count()} panel(es) · {layout}{broadcast} · Ctrl+Shift+T nuevo panel"
-        )
+        extra = "  ·  difusión" if workspace.broadcast else ""
+        self.status_right.setText(f"{workspace.count()} panel(es)  ·  {layout}{extra}")
         self._update_title()
 
     def closeEvent(self, event) -> None:  # noqa: N802

@@ -35,6 +35,17 @@ LAYOUT_LABELS = {
     "all": "Todos visibles",
 }
 
+LAYOUT_SHORT = {
+    "1": "1",
+    "2v": "2",
+    "2h": "↕2",
+    "4": "4",
+    "6": "6",
+    "all": "Todos",
+}
+
+SPLITTER_HANDLE = 8
+
 
 class WorkspaceWidget(QWidget):
     """Una pestaña: contiene N paneles y decide cuáles se ven."""
@@ -48,6 +59,7 @@ class WorkspaceWidget(QWidget):
     hostKeyRequested = Signal(object)
     userFocusRequested = Signal(object)
     directoryDropped = Signal(object, str)
+    filesDropped = Signal(object, list)
 
     def __init__(self, settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -63,7 +75,7 @@ class WorkspaceWidget(QWidget):
         self._host = QWidget(self)
         self._host.setObjectName("WorkspaceHost")
         self._host_layout = QVBoxLayout(self._host)
-        self._host_layout.setContentsMargins(0, 0, 0, 0)
+        self._host_layout.setContentsMargins(10, 10, 10, 10)
         self._host_layout.setSpacing(0)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
@@ -71,7 +83,7 @@ class WorkspaceWidget(QWidget):
         self._layout.addWidget(self._host, 1)
 
         self._placeholder = QLabel(
-            "No hay paneles en esta pestaña.\n\nCtrl+Shift+T  ·  nuevo panel", self._host
+            "Esta pestaña está vacía\n\nCtrl+Shift+T  ·  nuevo panel", self._host
         )
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setObjectName("Placeholder")
@@ -126,6 +138,7 @@ class WorkspaceWidget(QWidget):
         pane.hostKeyRequested.connect(self._on_host_key)
         pane.userFocusRequested.connect(self._on_user_focus)
         pane.directoryDropped.connect(self._on_directory_drop)
+        pane.filesDropped.connect(self._on_files_drop)
         self._panes.append(pane)
         if focus:
             self._active = len(self._panes) - 1
@@ -153,6 +166,7 @@ class WorkspaceWidget(QWidget):
                 (pane.hostKeyRequested, self._on_host_key),
                 (pane.userFocusRequested, self._on_user_focus),
                 (pane.directoryDropped, self._on_directory_drop),
+                (pane.filesDropped, self._on_files_drop),
             ):
                 try:
                     signal.disconnect(slot)
@@ -259,6 +273,10 @@ class WorkspaceWidget(QWidget):
         if pane in self._panes:
             self.directoryDropped.emit(pane, path)
 
+    def _on_files_drop(self, pane: PaneWidget, paths: list) -> None:
+        if pane in self._panes:
+            self.filesDropped.emit(pane, list(paths))
+
     # ------------------------------------------------------------------ diseño
     def set_layout(self, mode: str) -> None:
         if mode not in LAYOUT_CAPS or mode == self.layout_mode:
@@ -284,7 +302,7 @@ class WorkspaceWidget(QWidget):
             return panes[0]
         splitter = QSplitter(Qt.Orientation.Horizontal, self._host)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(4)
+        splitter.setHandleWidth(SPLITTER_HANDLE)
         for index, pane in enumerate(panes):
             splitter.addWidget(pane)
             splitter.setStretchFactor(index, 1)
@@ -337,7 +355,7 @@ class WorkspaceWidget(QWidget):
             else:
                 splitter = QSplitter(Qt.Orientation.Vertical, self._host)
                 splitter.setChildrenCollapsible(False)
-                splitter.setHandleWidth(4)
+                splitter.setHandleWidth(SPLITTER_HANDLE)
                 for index, row in enumerate(rows):
                     splitter.addWidget(self._make_row(row))
                     splitter.setStretchFactor(index, 1)
@@ -371,7 +389,7 @@ class WorkspaceWidget(QWidget):
             return panes[0]
         splitter = QSplitter(Qt.Orientation.Vertical, self._host)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(4)
+        splitter.setHandleWidth(SPLITTER_HANDLE)
         for index, pane in enumerate(panes):
             splitter.addWidget(pane)
             splitter.setStretchFactor(index, 1)

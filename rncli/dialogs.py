@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 from pathlib import Path
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
-from PySide6.QtCore import QProcess, Qt
+from PySide6.QtCore import QProcess, Qt, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QTextBrowser,
     QToolButton,
@@ -33,7 +35,7 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .agents import Agent
-from .config import LAYOUTS, Settings
+from .config import ESCAPE_KEY_LABELS, ESCAPE_KEY_MODES, LAYOUTS, Settings
 from .layouts import LAYOUT_LABELS
 from .theme import THEME_LABELS
 
@@ -47,18 +49,23 @@ class AgentChooserDialog(QDialog):
     def __init__(self, agents: list[Agent], settings: Settings, parent=None, cwd_hint: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · nuevo panel")
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(600)
         self._agents = agents
         self._selected: Agent | None = None
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(12)
         title = QLabel("¿Qué agente quieres lanzar?")
-        title.setStyleSheet("font-size: 15px; font-weight: 600;")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
         root.addWidget(title)
-        root.addWidget(QLabel("Pulsa el número del agente o haz clic. Esc para cancelar."))
+        hint = QLabel("Pulsa el número del agente o haz clic. Esc para cancelar.")
+        hint.setObjectName("Hint")
+        root.addWidget(hint)
 
         grid = QGridLayout()
-        grid.setSpacing(8)
+        grid.setSpacing(10)
+        grid.setVerticalSpacing(10)
         for index, agent in enumerate(agents):
             button = QToolButton()
             button.setObjectName("AgentButton")
@@ -72,8 +79,8 @@ class AgentChooserDialog(QDialog):
                     "Si lo tienes instalado, abre ⚙ → «Abrir config.json» y pon la ruta "
                     "absoluta en el campo \"command\"."
                 )
-            button.setMinimumHeight(58)
-            button.setSizePolicy(button.sizePolicy().horizontalPolicy(), button.sizePolicy().verticalPolicy())
+            button.setMinimumHeight(64)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             button.clicked.connect(lambda _=False, a=agent: self._choose(a))
             if not agent.available():
                 button.setProperty("missing", True)
@@ -174,11 +181,15 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, agents: list[Agent], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · ajustes")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
         self._agents = agents
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(14)
         form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
 
         self.font_combo = QFontComboBox()
         self.font_combo.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
@@ -227,6 +238,16 @@ class SettingsDialog(QDialog):
         form.addRow("Diseño al abrir", self.layout_combo)
         form.addRow("Agente por defecto", self.agent_combo)
         form.addRow("Carpeta inicial", dir_box)
+
+        self.escape_combo = QComboBox()
+        for key in ESCAPE_KEY_MODES:
+            self.escape_combo.addItem(ESCAPE_KEY_LABELS[key], key)
+        self.escape_combo.setCurrentIndex(max(0, self.escape_combo.findData(settings.escape_key)))
+        self.escape_combo.setToolTip(
+            "Tab y el resto de teclas van siempre al terminal seleccionado.\n"
+            "Escape puede ir al agente o usarse como Host Key (igual que Ctrl derecho)."
+        )
+        form.addRow("Tecla Escape", self.escape_combo)
         root.addLayout(form)
 
         box = QGroupBox("Comportamiento")
@@ -239,7 +260,18 @@ class SettingsDialog(QDialog):
         self.blink_check.setChecked(settings.cursor_blink)
         self.copy_check = QCheckBox("Copiar automáticamente al seleccionar")
         self.copy_check.setChecked(settings.copy_on_select)
-        for widget in (self.restore_check, self.confirm_check, self.blink_check, self.copy_check):
+        self.hidden_check = QCheckBox("Mostrar archivos ocultos en el explorador")
+        self.hidden_check.setChecked(settings.show_hidden_files)
+        self.hidden_check.setToolTip(
+            "Archivos y carpetas que empiezan por «.». También se cambia con .* o Ctrl+H en el explorador."
+        )
+        for widget in (
+            self.restore_check,
+            self.confirm_check,
+            self.blink_check,
+            self.copy_check,
+            self.hidden_check,
+        ):
             box_layout.addWidget(widget)
         root.addWidget(box)
 
@@ -269,6 +301,8 @@ class SettingsDialog(QDialog):
             copy_on_select=self.copy_check.isChecked(),
             bell_flash=base.bell_flash,
             start_dir=self.start_dir_edit.text().strip() or os.path.expanduser("~"),
+            escape_key=str(self.escape_combo.currentData() or "terminal"),
+            show_hidden_files=self.hidden_check.isChecked(),
         )
 
 
@@ -293,12 +327,16 @@ class ShortcutsDialog(QDialog):
         ("Ctrl+Shift+M", "Maximizar el panel activo (solo 1 visible)"),
         ("Terminal", None),
         ("Ctrl+Shift+C / Ctrl+Shift+V", "Copiar / pegar"),
+        ("Tab / Shift+Tab", "Siempre al terminal seleccionado (cursor-agent, Pi…)"),
         ("Ctrl derecho", "Host Key tipo VirtualBox: libera el foco y activa los atajos de RNCli"),
+        ("Escape", "Configurable en Ajustes: al terminal o Host Key de RNCli"),
         ("Shift+PageUp / Shift+PageDown", "Desplazarse por el historial"),
         ("Rueda del ratón", "Historial de la terminal"),
         ("Ctrl+Shift+B", "Activar/desactivar difusión (escribir en todos)"),
         ("Ctrl+Shift+R", "Reiniciar el agente activo"),
-        ("📁 Carpetas", "Explorador lateral: asignar una carpeta al activo o arrastrarla a un panel"),
+        ("Explorador", "Archivos y carpetas: arrastra un archivo a un terminal o usa «Pegar archivo»"),
+        ("··· en la barra", "Unir pestañas, reiniciar, sudo y ayuda"),
+        ("Ctrl+H", "En el explorador: mostrar u ocultar archivos ocultos"),
         ("Ctrl++ / Ctrl+- / Ctrl+0", "Tamaño de letra"),
         ("F11", "Pantalla completa"),
         ("Ctrl+Q", "Salir"),
@@ -307,8 +345,10 @@ class ShortcutsDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · atajos y ayuda")
-        self.resize(620, 640)
+        self.resize(640, 660)
         root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(12)
         browser = QTextBrowser()
         rows = []
         for key, description in self.SHORTCUTS:
@@ -335,83 +375,147 @@ class ShortcutsDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- sudo
-SUDO_STRATEGIES: list[tuple[str, str, str]] = [
-    (
-        "1. Timeout largo del cache (segura, recomendada)",
-        "Mantiene la contraseña en cache X minutos. No expone nada y sirve para cualquier comando.",
+class SudoStrategy(NamedTuple):
+    title: str
+    description: str
+    snippet: str
+    kind: str = "sudoers"  # sudoers | shell | note
+    dropin: str = ""
+
+
+SUDO_STRATEGIES: list[SudoStrategy] = [
+    SudoStrategy(
+        "1. Timeout largo del cache (solo alarga el cache)",
+        "Tras escribir la contraseña UNA vez en esa misma terminal, sudo no la vuelve a pedir "
+        "durante 90 minutos. No hace falta cerrar sesión. Los agentes en otros paneles SÍ "
+        "seguirán pidiendo contraseña: para ellos usa la estrategia 2 (NOPASSWD).",
         "Defaults timestamp_timeout=90\n",
+        "sudoers",
+        "rncli-timeout",
     ),
-    (
-        "2. NOPASSWD para comandos concretos (recomendada)",
-        "Solo esos comandos concretos se ejecutan sin contraseña, con rutas absolutas.",
-        "# Pi Coding Agent - comandos sin contrasena\n"
+    SudoStrategy(
+        "2. NOPASSWD para comandos concretos (recomendada para agentes)",
+        "Los agentes pueden ejecutar solo esos comandos sin contraseña (sudo -n). "
+        "No hace falta cerrar sesión: sudoers se aplica en el siguiente sudo.",
+        "# RNCli / agentes — comandos sin contraseña\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt update\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt update *\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt upgrade *\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt install *\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/apt-get update\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt-get update *\n"
+        "{user} ALL=(root) NOPASSWD: /usr/bin/apt-get upgrade *\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/apt-get install *\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/systemctl restart *\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/systemctl status *\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/docker *\n",
+        "sudoers",
+        "rncli-nopasswd-cmds",
     ),
-    (
+    SudoStrategy(
         "3. NOPASSWD para tus scripts",
         "Automatizaciones propias (en una carpeta que controles tú).",
         "{user} ALL=(root) NOPASSWD: /home/{user}/scripts/*\n",
+        "sudoers",
+        "rncli-nopasswd-scripts",
     ),
-    (
+    SudoStrategy(
         "4. Extensión con whitelist en código (máximo control)",
         "El agente usa una herramienta propia que valida los comandos y deja log de auditoría.",
         "# Ver la extensión completa en sudo-config-strategies.md (sección 4):\n"
         "# ~/.pi/agent/extensions/sudo-helper.ts  -> herramienta sudo_run + sudo_check\n",
+        "note",
+        "",
     ),
-    (
+    SudoStrategy(
         "5. sudoedit para archivos de sistema",
         "Editar configuración como root sin ejecutar código arbitrario.",
         "{user} ALL=(root) NOPASSWD: /usr/bin/sudoedit /etc/nginx/*\n"
         "{user} ALL=(root) NOPASSWD: /usr/bin/sudoedit /etc/hosts\n",
+        "sudoers",
+        "rncli-sudoedit",
     ),
-    (
+    SudoStrategy(
         "6. runas_spec restringido",
         "Ejecutar como otro usuario (no root) con el mínimo privilegio.",
         "{user} ALL=(www-data) NOPASSWD: ALL\n"
         "{user} ALL=(postgres) NOPASSWD: /usr/bin/psql\n",
+        "sudoers",
+        "rncli-runas",
     ),
-    (
-        "7. sshpass / contraseña en disco (RIESGO ALTO)",
+    SudoStrategy(
+        "7. Contraseña en disco (RIESGO ALTO)",
         "Funciona con cualquier comando, pero deja la contraseña en disco. Solo para pruebas.",
-        "# NO recomendado en producción:\n"
-        "echo \"tu_contrasena\" > ~/.sudo_pass && chmod 600 ~/.sudo_pass\n"
-        "# el agente usaria: cat ~/.sudo_pass | sudo -S <comando>\n",
+        "umask 077\n"
+        "read -s -p 'Contraseña sudo: ' p; echo\n"
+        "printf '%s\\n' \"$p\" > \"$HOME/.sudo_pass\"\n"
+        "chmod 600 \"$HOME/.sudo_pass\"\n"
+        "unset p\n"
+        "echo 'Uso: cat ~/.sudo_pass | sudo -S <comando>'\n",
+        "shell",
+        "",
     ),
-    (
+    SudoStrategy(
         "8. Contraseña en variable de entorno (RIESGO ALTO)",
         "Rápida de configurar, pero visible con 'env' o /proc/self/environ.",
-        "# En ~/.bashrc (no recomendado):\n"
-        "export SUDO_ASKPASS_PASSWORD=\"tu_contrasena\"\n",
+        "read -s -p 'Contraseña sudo: ' SUDO_ASKPASS_PASSWORD; echo\n"
+        "export SUDO_ASKPASS_PASSWORD\n"
+        "echo 'Uso: printf %s \"$SUDO_ASKPASS_PASSWORD\" | sudo -S <comando>'\n",
+        "shell",
+        "",
     ),
 ]
 
 
+def install_sudoers_bash(dropin: str, body: str) -> str:
+    """Un solo comando bash: autentica en la TTY y luego escribe /etc/sudoers.d/.
+
+    Empieza por ``sudo -v`` para que la contraseña se pida *antes* del pipe a
+    ``tee``. Si no, sudo ve el fichero por stdin y responde «a password is required».
+    """
+    path = f"/etc/sudoers.d/{dropin}"
+    lines = body.rstrip("\n").split("\n")
+    printf_args = " ".join(shlex.quote(line) for line in lines)
+    dest = shlex.quote(path)
+    return (
+        f"sudo -v && "
+        f"{{ test -f {dest} && sudo cp {dest} {dest}.bak; "
+        f"printf '%s\\n' {printf_args} | sudo tee {dest} >/dev/null; }} && "
+        f"sudo chmod 440 {dest} && "
+        f"sudo visudo -cf {dest} && "
+        f"echo && echo 'RNCli: sudoers OK → {path}' && "
+        f"sudo -l"
+    )
+
+
 class SudoDialog(QDialog):
-    """Utilidades de sudo generadas a partir de sudo-config-strategies.md."""
+    """Genera el comando bash completo para configurar sudo (cópialo o envíalo a un panel)."""
+
+    sendRequested = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · sudo para agentes")
-        self.setMinimumWidth(640)
+        self.setMinimumWidth(720)
         self._user = os.environ.get("USER") or os.environ.get("LOGNAME") or "usuario"
 
         root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(12)
         intro = QLabel(
-            "Configura <code>sudo</code> para que tus agentes puedan trabajar sin quedarse "
-            "esperando la contraseña. Copia el fragmento, revísalo y pégalo con <code>sudo visudo</code>. "
-            f"{APP_NAME} no modifica <code>/etc/sudoers</code> por ti."
+            "Elige una estrategia. RNCli monta <b>el comando bash entero</b> "
+            "(<code>sudo -v</code> pide la contraseña en la terminal; luego escribe "
+            "<code>/etc/sudoers.d/</code>). <b>No hace falta cerrar sesión ni reiniciar.</b> "
+            "Para que los agentes no se queden esperando una contraseña usa la "
+            "<b>estrategia 2 (NOPASSWD)</b>. La 1 solo alarga el cache en esa misma terminal."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.TextFormat.RichText)
         root.addWidget(intro)
 
         self.combo = QComboBox()
-        for title, _description, _snippet in SUDO_STRATEGIES:
-            self.combo.addItem(title)
+        for strategy in SUDO_STRATEGIES:
+            self.combo.addItem(strategy.title)
         self.combo.currentIndexChanged.connect(self._refresh)
         root.addWidget(self.combo)
 
@@ -420,25 +524,36 @@ class SudoDialog(QDialog):
         self.description.setObjectName("Hint")
         root.addWidget(self.description)
 
+        command_label = QLabel("Comando bash (editable: revísalo y copia o envía)")
+        command_label.setObjectName("FileBrowserTitle")
+        root.addWidget(command_label)
+
         self.snippet = QPlainTextEdit()
-        self.snippet.setReadOnly(True)
         self.snippet.setFont(QFont("monospace", 10))
-        self.snippet.setMinimumHeight(150)
-        root.addWidget(self.snippet)
+        self.snippet.setMinimumHeight(220)
+        self.snippet.setPlaceholderText("Aquí aparece el comando completo…")
+        root.addWidget(self.snippet, 1)
 
         row = QHBoxLayout()
-        copy_snippet = QPushButton("Copiar fragmento")
-        copy_snippet.clicked.connect(self._copy_snippet)
-        copy_all = QPushButton("Copiar instrucciones completas")
-        copy_all.clicked.connect(self._copy_instructions)
-        test_button = QPushButton("Comprobar sudo sin contraseña")
+        copy_cmd = QPushButton("Copiar comando bash")
+        copy_cmd.setObjectName("PrimaryButton")
+        copy_cmd.setToolTip("Copia el comando entero al portapapeles para pegarlo en Bash")
+        copy_cmd.clicked.connect(self._copy_command)
+        send_btn = QPushButton("Enviar a un Bash")
+        send_btn.setToolTip(
+            "Abre (o reutiliza) un panel Bash en RNCli y pega el comando.\n"
+            "Escribe tu contraseña en esa terminal cuando sudo la pida."
+        )
+        send_btn.clicked.connect(self._send_to_bash)
+        test_button = QPushButton("Comprobar sudo")
+        test_button.setToolTip("Ejecuta sudo -n true para ver si ya no pide contraseña")
         test_button.clicked.connect(self._test_sudo)
-        row.addWidget(copy_snippet)
-        row.addWidget(copy_all)
+        row.addWidget(copy_cmd)
+        row.addWidget(send_btn)
         row.addWidget(test_button)
         row.addStretch(1)
         if MD_GUIDE.exists():
-            open_guide = QPushButton("Abrir la guía completa")
+            open_guide = QPushButton("Guía completa")
             open_guide.clicked.connect(lambda: QProcess.startDetached("xdg-open", [str(MD_GUIDE)]))
             row.addWidget(open_guide)
         root.addLayout(row)
@@ -456,46 +571,97 @@ class SudoDialog(QDialog):
         self._refresh()
 
     # ------------------------------------------------------------------ utilidades
-    def _current(self) -> tuple[str, str, str]:
+    def _current(self) -> SudoStrategy:
         return SUDO_STRATEGIES[self.combo.currentIndex()]
 
     def _snippet_text(self) -> str:
-        _title, _description, snippet = self._current()
-        return snippet.format(user=self._user)
+        return self._current().snippet.format(user=self._user)
+
+    def _command_text(self) -> str:
+        return self.snippet.toPlainText().strip()
+
+    def _bash_command(self) -> str:
+        strategy = self._current()
+        body = self._snippet_text()
+        header = (
+            f"# {strategy.title}\n"
+            f"# Usuario: {self._user}\n"
+            "# Revisa el comando. Pégalo en un Bash de RNCli o pulsa «Enviar a un Bash».\n"
+        )
+        if strategy.kind == "sudoers" and strategy.dropin:
+            header += (
+                f"# Escribe /etc/sudoers.d/{strategy.dropin} (no toca /etc/sudoers).\n"
+                "# sudo -v pedirá la contraseña UNA vez en esta terminal; no hace falta relogin.\n\n"
+            )
+            return header + install_sudoers_bash(strategy.dropin, body)
+        if strategy.kind == "shell":
+            header += "# RIESGO ALTO: la contraseña la pides tú en el Bash; RNCli no la guarda.\n\n"
+            return header + body.rstrip() + "\n"
+        guide = str(MD_GUIDE) if MD_GUIDE.exists() else "sudo-config-strategies.md"
+        return (
+            header
+            + "# Esta estrategia no es un drop-in de sudoers.\n"
+            + f"echo {shlex.quote(strategy.description)}\n"
+            + f"mkdir -p \"$HOME/.pi/agent/extensions\"\n"
+            + f"echo {shlex.quote('Copia sudo-helper.ts de la guía a ~/.pi/agent/extensions/')}\n"
+            + f"test -f {shlex.quote(guide)} && xdg-open {shlex.quote(guide)} || true\n"
+        )
 
     def _refresh(self) -> None:
-        _title, description, _snippet = self._current()
-        self.description.setText(description)
-        self.snippet.setPlainText(self._snippet_text())
-        if self.combo.currentIndex() in (6, 7):
+        strategy = self._current()
+        self.description.setText(strategy.description)
+        self.snippet.setPlainText(self._bash_command())
+        if strategy.kind == "shell":
             self.status.setText(
-                "⚠ Esta opción guarda la contraseña en disco o en el entorno: úsala solo en una "
-                "máquina de confianza y nunca en producción."
+                "⚠ Esta opción trata la contraseña en disco o en el entorno: "
+                "úsalo solo en una máquina de confianza, nunca en producción."
+            )
+        elif strategy.kind == "note":
+            self.status.setText("Esta opción abre la guía: no cambia sudoers.")
+        elif self.combo.currentIndex() == 0:
+            self.status.setText(
+                f"Usuario: {self._user}  ·  /etc/sudoers.d/{strategy.dropin}  ·  "
+                "sigue pidiendo contraseña a los agentes; para eso usa la estrategia 2."
             )
         else:
-            self.status.setText(f"Usuario detectado: {self._user}")
+            self.status.setText(
+                f"Usuario detectado: {self._user}  ·  archivo: /etc/sudoers.d/{strategy.dropin}  ·  "
+                "se aplica al siguiente sudo, sin relogin."
+            )
+
+    def _copy_command(self) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        text = self._command_text()
+        if not text:
+            self.status.setText("No hay comando que copiar.")
+            return
+        QApplication.clipboard().setText(text + "\n")
+        self.status.setText(
+            "Comando copiado. Pégalo en un Bash (panel de RNCli o una terminal) y pulsa Enter."
+        )
 
     def _copy_snippet(self) -> None:
+        """Compatibilidad: el fragmento sudoers crudo (lo usan las pruebas)."""
         from PySide6.QtWidgets import QApplication
 
         QApplication.clipboard().setText(self._snippet_text())
-        self.status.setText("Fragmento copiado. Recuerda: sudo visudo  →  pegar  →  guardar.")
+        self.status.setText("Fragmento sudoers copiado.")
 
     def _copy_instructions(self) -> None:
-        from PySide6.QtWidgets import QApplication
+        self._copy_command()
 
-        text = (
-            f"# {self._current()[0]}\n"
-            f"# {self._current()[1]}\n\n"
-            "1) sudo cp /etc/sudoers /etc/sudoers.bak\n"
-            "2) sudo visudo\n"
-            "3) pega al final:\n\n"
-            f"{self._snippet_text()}\n"
-            "4) guarda y valida con: sudo visudo -c\n"
-            "5) comprueba con: sudo -l\n"
+    def _send_to_bash(self) -> None:
+        text = self._command_text()
+        if not text:
+            self.status.setText("No hay comando que enviar.")
+            return
+        self.sendRequested.emit(text)
+        self.status.setText(
+            "Enviado a un panel Bash. Escribe tu contraseña ahí si sudo la pide. "
+            "Luego puedes cerrar este diálogo."
         )
-        QApplication.clipboard().setText(text)
-        self.status.setText("Instrucciones completas copiadas al portapapeles.")
+        self.accept()
 
     def _test_sudo(self) -> None:
         if not shutil.which("sudo"):
@@ -513,6 +679,7 @@ class SudoDialog(QDialog):
             )
         else:
             self.status.setText(
-                "✗ sudo pide contraseña. Aplica alguna estrategia (1 o 2 suelen bastar: "
-                "«sudo -n true» debe devolver 0)."
+                "✗ sudo -n sigue pidiendo contraseña. Eso es normal con la estrategia 1 "
+                "(solo cache). Instala la 2 (NOPASSWD), pega el comando nuevo y no hace "
+                "falta cerrar sesión: el siguiente sudo ya usa el drop-in."
             )

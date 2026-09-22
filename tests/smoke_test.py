@@ -10,9 +10,12 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+if "RNCLI_CONFIG_DIR" not in os.environ:
+    os.environ["RNCLI_CONFIG_DIR"] = tempfile.mkdtemp(prefix="rncli-config-")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import QEventLoop, QTimer
@@ -213,6 +216,66 @@ def main() -> int:
     check("LINEA-" in selected, "se puede seleccionar y copiar el contenido")
     terminal.copy_selection()
     check("LINEA-" in QApplication.clipboard().text(), "copiar lleva el texto al portapapeles")
+    from PySide6.QtGui import QFont
+
+    strategy = terminal._font.styleStrategy()
+    no_lcd = getattr(QFont.StyleStrategy, "NoSubpixelAntialias")
+    has_no_lcd = (
+        strategy == no_lcd
+        or getattr(strategy, "name", "") == "NoSubpixelAntialias"
+        or no_lcd.name in str(strategy)
+    )
+    check(has_no_lcd, "la fuente evita el antialias LCD que deja manchas azules")
+
+    from rncli.terminal import PAD_X, PAD_Y
+
+    marker_line = "COPIA-FINAL-XY"
+    active.send(f'printf "%s\\n" "{marker_line}"\n'.encode())
+    wait(500)
+    found_row = found_col = None
+    for abs_row in range(terminal._history_len() + terminal._screen.lines):
+        row_text = "".join(ch.data or " " for ch in terminal._row_abs(abs_row))
+        idx = row_text.find(marker_line)
+        if idx >= 0:
+            found_row, found_col = abs_row, idx
+            break
+    check(found_row is not None, "la línea de prueba de copia está en pantalla")
+    if found_row is not None:
+        last_col = found_col + len(marker_line) - 1
+        terminal._sel_anchor = (found_row, found_col)
+        terminal._sel_focus = (found_row, last_col)
+        terminal._sel_visible = True
+        check(
+            terminal.selected_text() == marker_line,
+            "copiar incluye los dos últimos caracteres de la selección",
+        )
+        visible_row = found_row - (terminal._history_len() - terminal._scroll_offset)
+        if 0 <= visible_row < terminal._screen.lines:
+            click_x = PAD_X + last_col * terminal._cell_w + terminal._cell_w / 2
+            click_y = PAD_Y + visible_row * terminal._cell_h + terminal._cell_h / 2
+            cell = terminal._cell_at(click_x, click_y)
+            check(
+                cell == (found_row, last_col),
+                "el clic en la última letra cae en esa misma celda",
+            )
+            edge = terminal._cell_at(
+                PAD_X + terminal._screen.columns * terminal._cell_w + 12,
+                click_y,
+            )
+            check(
+                edge is not None and edge[1] == terminal._screen.columns - 1,
+                "arrastrar al margen selecciona la última columna",
+            )
+        else:
+            check(False, "el clic en la última letra cae en esa misma celda")
+            check(False, "arrastrar al margen selecciona la última columna")
+        terminal._clear_selection()
+        check(terminal.selected_text() == "", "un clic no deja un cuadrado de selección")
+    else:
+        check(False, "copiar incluye los dos últimos caracteres de la selección")
+        check(False, "el clic en la última letra cae en esa misma celda")
+        check(False, "arrastrar al margen selecciona la última columna")
+        check(False, "un clic no deja un cuadrado de selección")
 
     # --- sesión guardada ---------------------------------------------------------
     from rncli.config import load_session, save_session
@@ -282,14 +345,252 @@ def main() -> int:
     check(chooser.chosen_agent() is not None, "el selector de agentes lista los agentes")
     chooser.deleteLater()
     sudo = SudoDialog(window)
-    snippets_ok = all(sudo._snippet_text() for _ in range(sudo.combo.count()))
+    snippets_ok = True
+    bash_ok = True
     for index in range(sudo.combo.count()):
         sudo.combo.setCurrentIndex(index)
         snippets_ok = snippets_ok and bool(sudo._snippet_text().strip())
-    check(snippets_ok, "el asistente de sudo genera los 8 fragmentos del manual")
+        bash_ok = bash_ok and bool(sudo._bash_command().strip())
+    check(sudo.combo.count() == 8 and snippets_ok, "el asistente de sudo genera los 8 fragmentos del manual")
+    check(bash_ok, "el asistente de sudo genera el comando bash completo")
+    sudo.combo.setCurrentIndex(0)
+    cmd = sudo._bash_command()
+    check(
+        "sudo -v" in cmd and "sudo tee" in cmd and "chmod 440" in cmd and "visudo -cf" in cmd,
+        "el comando instala un drop-in en /etc/sudoers.d y lo valida",
+    )
+    sudo.combo.setCurrentIndex(1)
+    check(
+        sudo._user in sudo._bash_command(),
+        "el comando NOPASSWD incluye el usuario detectado",
+    )
+    sent: list[str] = []
+    sudo.sendRequested.connect(sent.append)
+    sudo.snippet.setPlainText("echo RNCLI-SUDO-BASH\n")
+    sudo._send_to_bash()
+    check(sent == ["echo RNCLI-SUDO-BASH"], "enviar a Bash emite el comando entero")
     sudo.deleteLater()
     ShortcutsDialog(window).deleteLater()
-    SettingsDialog(config.settings, config.agents, window).deleteLater()
+
+    from PySide6.QtCore import QEvent, Qt
+    from PySide6.QtGui import QKeyEvent
+    from rncli.terminal import is_host_key, tab_sequence
+
+    settings_ui = SettingsDialog(config.settings, config.agents, window)
+    check(settings_ui.escape_combo.count() == 2, "ajustes permite configurar la tecla Escape")
+    settings_ui.escape_combo.setCurrentIndex(max(0, settings_ui.escape_combo.findData("host")))
+    escaped = settings_ui.result_settings(config.settings)
+    check(escaped.escape_key == "host", "ajustes guarda Escape como Host Key")
+    settings_ui.hidden_check.setChecked(True)
+    escaped = settings_ui.result_settings(config.settings)
+    check(escaped.show_hidden_files is True, "ajustes guarda mostrar archivos ocultos")
+    settings_ui.deleteLater()
+
+    from rncli.config import Settings as SettingsCls
+
+    check(SettingsCls.from_dict({"escape_key": "host"}).escape_key == "host", "config.json acepta escape_key=host")
+    check(
+        SettingsCls.from_dict({"escape_key": "espacio"}).escape_key == "terminal",
+        "escape_key inválida usa el terminal",
+    )
+    check(
+        SettingsCls.from_dict({}).show_hidden_files is False,
+        "los archivos ocultos vienen desactivados por defecto",
+    )
+    check(
+        SettingsCls.from_dict({"show_hidden_files": True}).show_hidden_files is True,
+        "config.json recuerda mostrar archivos ocultos",
+    )
+    check(
+        SettingsCls.from_dict({"theme": "modern_dark"}).theme == "modern_dark",
+        "config.json acepta el tema modern_dark",
+    )
+    check(hasattr(window, "prompt") and window.prompt.objectName() == "PromptBar", "la barra de escritura está montada")
+    check(
+        hasattr(window, "layout_buttons")
+        and list(window.layout_buttons) == ["1", "2v", "2h", "4", "6", "all"],
+        "la barra muestra el selector de diseño",
+    )
+    from rncli.theme import THEME_LABELS, app_stylesheet
+
+    check("modern_dark" in THEME_LABELS, "ajustes lista el tema Grafito")
+    check("PromptContainer" in app_stylesheet("oscuro"), "el estilo incluye la barra de escritura")
+    try:
+        window._on_prompt("echo RNCLI-PROMPT-OK", False)
+        prompt_send_ok = True
+    except Exception:
+        prompt_send_ok = False
+    check(prompt_send_ok, "enviar desde la barra de escritura no falla")
+
+    tab_ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier, "\t")
+    check(tab_sequence(tab_ev) == b"\t", "Tab se envía al agente (cursor-agent)")
+    backtab_ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Backtab, Qt.KeyboardModifier.ShiftModifier
+    )
+    check(tab_sequence(backtab_ev) == b"\x1b[Z", "Shift+Tab se envía al agente (Pi)")
+    ctrl_tab_ev = QKeyEvent(
+        QEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.ControlModifier
+    )
+    check(tab_sequence(ctrl_tab_ev) is None, "Ctrl+Tab no se envía al agente")
+
+    esc_ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+    host_settings = dataclasses.replace(config.settings, escape_key="host")
+    term_settings = dataclasses.replace(config.settings, escape_key="terminal")
+    check(is_host_key(esc_ev, host_settings), "Escape configurado es Host Key")
+    check(not is_host_key(esc_ev, term_settings), "Escape por defecto va al terminal")
+
+    target = workspace.add_pane(shell, "/tmp")
+    wait(200)
+    if target is not None and target.terminal is not None and target.session is not None:
+        target.terminal.settings = term_settings
+        target.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
+        wait(50)
+        recorded: list[bytes] = []
+        real_write = target.session.write
+
+        def spy(data: bytes, _real=real_write) -> None:
+            recorded.append(bytes(data))
+            return _real(data)
+
+        target.session.write = spy  # type: ignore[method-assign]
+        tab_press = QKeyEvent(
+            QEvent.Type.KeyPress, Qt.Key.Key_Tab, Qt.KeyboardModifier.NoModifier, "\t"
+        )
+        handled = target.terminal.event(tab_press)
+        wait(40)
+        check(
+            bool(handled) and any(b"\t" in chunk for chunk in recorded),
+            "Tab llega al terminal seleccionado",
+        )
+        check(
+            target.terminal.focusNextPrevChild(True) is False,
+            "Tab no cambia el foco a otro widget",
+        )
+        recorded.clear()
+        host_hits: list[bool] = []
+        target.terminal.settings = host_settings
+        target.terminal.hostKeyPressed.connect(lambda: host_hits.append(True))
+        QApplication.sendEvent(
+            target.terminal,
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier),
+        )
+        wait(40)
+        check(
+            bool(host_hits) and not any(chunk == b"\x1b" for chunk in recorded),
+            "Escape como Host Key no se envía al agente",
+        )
+        target.session.write = real_write  # type: ignore[method-assign]
+    else:
+        check(False, "Tab llega al terminal seleccionado")
+        check(False, "Tab no cambia el foco a otro widget")
+        check(False, "Escape como Host Key no se envía al agente")
+
+    from PySide6.QtCore import QDir, QMimeData, QPoint, QPointF, QUrl, Qt
+    from PySide6.QtGui import QDragEnterEvent, QDropEvent
+
+    from rncli.terminal import quote_drop_paths, split_drop_paths
+
+    filt = window.file_browser.model.filter()
+    check(bool(filt & QDir.Filter.Files), "el explorador lista archivos además de carpetas")
+    check(not bool(filt & QDir.Filter.Hidden), "los archivos ocultos no se muestran por defecto")
+    check(not window.file_browser.show_hidden, "el explorador arranca sin archivos ocultos")
+    check(not window.file_browser.add_button.isEnabled(), "añadir archivo exige seleccionar uno")
+    window.file_browser.set_show_hidden(True)
+    check(
+        bool(window.file_browser.model.filter() & QDir.Filter.Hidden)
+        and window.file_browser.show_hidden
+        and window.file_browser.hidden_button.isChecked()
+        and window.act_show_hidden.isChecked()
+        and window.settings.show_hidden_files,
+        "se pueden volver a ver los archivos ocultos",
+    )
+    window.file_browser.toggle_show_hidden()
+    check(
+        not bool(window.file_browser.model.filter() & QDir.Filter.Hidden)
+        and not window.file_browser.show_hidden
+        and not window.settings.show_hidden_files,
+        "se pueden volver a ocultar los archivos ocultos",
+    )
+
+    tmpdir = tempfile.mkdtemp(prefix="rncli-drop-")
+    samples = {
+        "foto.png": b"\x89PNG\r\n",
+        "nota.pdf": b"%PDF-1.4\n",
+        "texto.txt": b"hola agente\n",
+    }
+    sample_paths = []
+    for name, payload in samples.items():
+        path = os.path.join(tmpdir, name)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        sample_paths.append(os.path.realpath(path))
+
+    files, dirs = split_drop_paths([*sample_paths, tmpdir])
+    check(len(files) == 3 and dirs == [os.path.realpath(tmpdir)], "separa archivos de carpetas")
+    quoted = quote_drop_paths(sample_paths)
+    check(
+        all(name in quoted for name in samples),
+        "entrecomilla imagen, PDF y texto",
+    )
+
+    chosen: list[str] = []
+    window.file_browser.filesRequested.connect(lambda paths: chosen.extend(paths))
+    window.file_browser._selected_files = list(sample_paths)
+    window.file_browser._update_labels()
+    check(window.file_browser.add_button.isEnabled(), "el botón añadir se activa con archivos")
+    window.file_browser._add_files()
+    check(chosen == sample_paths, "añadir archivo emite los archivos elegidos")
+
+    drop_pane = workspace.active_pane()
+    if drop_pane is not None and drop_pane.terminal is not None and drop_pane.session is not None:
+        recorded: list[bytes] = []
+        real_write = drop_pane.session.write
+
+        def drop_spy(data: bytes, _real=real_write) -> None:
+            recorded.append(bytes(data))
+            return _real(data)
+
+        drop_pane.session.write = drop_spy  # type: ignore[method-assign]
+        drop_pane.terminal.insert_paths(sample_paths)
+        joined = b"".join(recorded)
+        check(
+            all(name.encode() in joined for name in samples),
+            "pega rutas de imagen, PDF y texto en el terminal",
+        )
+        recorded.clear()
+        dropped: list[str] = []
+        drop_pane.terminal.filesDropped.connect(lambda paths: dropped.extend(paths))
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(sample_paths[0])])
+        enter = QDragEnterEvent(
+            QPoint(12, 12),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        drop_pane.terminal.dragEnterEvent(enter)
+        check(enter.isAccepted(), "el terminal acepta soltar un archivo del explorador")
+        drop_ev = QDropEvent(
+            QPointF(12, 12),
+            Qt.DropAction.CopyAction,
+            mime,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+        drop_pane.terminal.dropEvent(drop_ev)
+        wait(40)
+        check(
+            bool(drop_ev.isAccepted())
+            and any(os.path.basename(sample_paths[0]).encode() in chunk for chunk in recorded)
+            and any(os.path.samefile(sample_paths[0], path) for path in dropped),
+            "soltar un archivo lo pega en ese terminal",
+        )
+        drop_pane.session.write = real_write  # type: ignore[method-assign]
+    else:
+        check(False, "pega rutas de imagen, PDF y texto en el terminal")
+        check(False, "el terminal acepta soltar un archivo del explorador")
+        check(False, "soltar un archivo lo pega en ese terminal")
 
     if args.screenshot:
         window.workspace().set_layout("all")

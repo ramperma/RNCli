@@ -15,6 +15,11 @@ SESSION_PATH = CONFIG_DIR / "session.json"
 LOG_PATH = CONFIG_DIR / "rncli.log"
 
 LAYOUTS = ["1", "2v", "2h", "4", "6", "all"]
+ESCAPE_KEY_MODES = ["terminal", "host"]
+ESCAPE_KEY_LABELS = {
+    "terminal": "Al terminal seleccionado (agentes, vim…)",
+    "host": "Host Key de RNCli (como Ctrl derecho)",
+}
 
 
 @dataclass
@@ -31,6 +36,8 @@ class Settings:
     copy_on_select: bool = False
     bell_flash: bool = True
     start_dir: str = str(Path.home())
+    escape_key: str = "terminal"       # terminal | host
+    show_hidden_files: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -55,8 +62,10 @@ class Settings:
             clean[key] = value
         if clean.get("default_layout") not in LAYOUTS:
             clean["default_layout"] = "1"
-        if clean.get("theme") not in {"oscuro", "dracula", "claro"}:
+        if clean.get("theme") not in {"oscuro", "dracula", "claro", "modern_dark"}:
             clean["theme"] = "oscuro"
+        if clean.get("escape_key") not in ESCAPE_KEY_MODES:
+            clean["escape_key"] = "terminal"
         return cls(**clean)
 
 

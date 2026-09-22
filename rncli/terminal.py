@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import shlex
 
 import pyte
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal
@@ -59,6 +60,72 @@ CURSOR_KEYS = {
     Qt.Key.Key_End: "F",
 }
 
+# Modificadores que no deben acompañar a Tab ni a Escape-como-Host-Key.
+_NAV_MODS = (
+    Qt.KeyboardModifier.ControlModifier
+    | Qt.KeyboardModifier.AltModifier
+    | Qt.KeyboardModifier.MetaModifier
+)
+_HOST_MODS = _NAV_MODS | Qt.KeyboardModifier.ShiftModifier
+
+
+def is_right_ctrl(event) -> bool:
+    """Ctrl derecho (scan code 105 / keysym 65508), Host Key tipo VirtualBox."""
+    return event.key() == Qt.Key.Key_Control and (
+        event.nativeScanCode() == 105 or event.nativeVirtualKey() in (65508, 0xFFE4)
+    )
+
+
+def is_host_key(event, settings) -> bool:
+    """True si la tecla libera el teclado hacia RNCli y no debe ir al agente."""
+    if is_right_ctrl(event):
+        return True
+    if getattr(settings, "escape_key", "terminal") != "host":
+        return False
+    return event.key() == Qt.Key.Key_Escape and not bool(event.modifiers() & _HOST_MODS)
+
+
+def tab_sequence(event) -> bytes | None:
+    """Tab / Shift+Tab para el agente. None si Ctrl/Alt/Meta deben quedársela RNCli."""
+    if event.key() not in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+        return None
+    if event.modifiers() & _NAV_MODS:
+        return None
+    reverse = event.key() == Qt.Key.Key_Backtab or bool(
+        event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+    )
+    return b"\x1b[Z" if reverse else b"\t"
+
+
+def local_drop_paths(mime) -> list[str]:
+    """Rutas locales existentes que vienen en un arrastre (explorador u otro)."""
+    if mime is None or not mime.hasUrls():
+        return []
+    paths: list[str] = []
+    for url in mime.urls():
+        if not url.isLocalFile():
+            continue
+        path = os.path.realpath(os.path.expanduser(url.toLocalFile() or ""))
+        if path and os.path.exists(path):
+            paths.append(path)
+    return list(dict.fromkeys(paths))
+
+
+def split_drop_paths(paths: list[str]) -> tuple[list[str], list[str]]:
+    """Separa archivos (imagen, PDF, texto…) de carpetas."""
+    files: list[str] = []
+    directories: list[str] = []
+    for path in paths:
+        if os.path.isfile(path):
+            files.append(path)
+        elif os.path.isdir(path):
+            directories.append(path)
+    return files, directories
+
+
+def quote_drop_paths(paths: list[str]) -> str:
+    return " ".join(shlex.quote(path) for path in paths if path)
+
 
 class TerminalWidget(QWidget):
     """Terminal con scrollback, selección, copiar/pegar y aviso de campana."""
@@ -68,6 +135,7 @@ class TerminalWidget(QWidget):
     userFocusReceived = Signal()
     hostKeyPressed = Signal()
     directoryDropped = Signal(str)
+    filesDropped = Signal(list)
     restartRequested = Signal()
     bell = Signal()
     titleChanged = Signal(str)
@@ -88,6 +156,9 @@ class TerminalWidget(QWidget):
 
         self._sel_anchor: tuple[int, int] | None = None
         self._sel_focus: tuple[int, int] | None = None
+        self._sel_press: tuple[int, int] | None = None
+        self._sel_visible = False
+        self._last_cursor: tuple[int, int] | None = None
 
         self._font = QFont(settings.font_family)
         self._font.setStyleHint(QFont.StyleHint.Monospace)
@@ -111,7 +182,7 @@ class TerminalWidget(QWidget):
         if settings.cursor_blink:
             self._blink_timer.start()
 
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAutoFillBackground(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.IBeamCursor)
@@ -126,7 +197,17 @@ class TerminalWidget(QWidget):
         session.dataReceived.connect(self._feed)
 
     # ------------------------------------------------------------------ tamaño
+    @staticmethod
+    def _apply_font_strategy(font: QFont) -> None:
+        """Sin antialias LCD: al pintar celda a celda deja franjas azul/rojo."""
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFixedPitch(True)
+        font.setStyleStrategy(
+            QFont.StyleStrategy.NoSubpixelAntialias | QFont.StyleStrategy.PreferMatch
+        )
+
     def _recalc_fonts(self) -> None:
+        self._apply_font_strategy(self._font)
         self._font_bold = QFont(self._font)
         self._font_bold.setBold(True)
         self._font_italic = QFont(self._font)
@@ -134,6 +215,8 @@ class TerminalWidget(QWidget):
         self._font_bold_italic = QFont(self._font)
         self._font_bold_italic.setBold(True)
         self._font_bold_italic.setItalic(True)
+        for variant in (self._font_bold, self._font_italic, self._font_bold_italic):
+            self._apply_font_strategy(variant)
         metrics = QFontMetricsF(self._font)
         # Celdas con medidas enteras: si no, los repintados parciales dejan franjas.
         self._cell_w = float(max(1, math.ceil(metrics.horizontalAdvance("M"))))
@@ -142,8 +225,6 @@ class TerminalWidget(QWidget):
 
     def set_font(self, family: str, size: int) -> None:
         self._font = QFont(family)
-        self._font.setStyleHint(QFont.StyleHint.Monospace)
-        self._font.setFixedPitch(True)
         self._font.setPointSizeF(max(6.0, float(size)))
         self._recalc_fonts()
         self._apply_size()
@@ -287,24 +368,8 @@ class TerminalWidget(QWidget):
         self._feed(text.replace("\n", "\r\n").encode("utf-8", "replace"))
 
     def _schedule_repaint(self) -> None:
-        dirty = set(self._screen.dirty)
         self._screen.dirty.clear()
-        if self._scroll_offset > 0 or not dirty:
-            self.update()
-            return
-        region = None
-
-        for row in dirty:
-            if 0 <= row < self._screen.lines:
-                rect = QRect(
-                    0,
-                    int(PAD_Y + row * self._cell_h),
-                    self.width(),
-                    int(self._cell_h) + 1,
-                )
-                region = rect if region is None else region.united(rect)
-        if region is not None:
-            self.update(region)
+        self.update()
 
     def _emit_bell(self) -> None:
         self.bell.emit()
@@ -313,35 +378,22 @@ class TerminalWidget(QWidget):
         if not self.hasFocus() or self._scroll_offset > 0:
             return
         self._cursor_on = not self._cursor_on
-        row = self._screen.cursor.y
-        self.update(QRect(0, int(PAD_Y + row * self._cell_h), self.width(), int(self._cell_h) + 1))
+        self.update()
 
     # ------------------------------------------------------------------ teclado
-    @staticmethod
-    def _is_host_key(event) -> bool:
-        """Ctrl derecho, equivalente al Host Key de VirtualBox.
+    def _is_host_key(self, event) -> bool:
+        return is_host_key(event, self.settings)
 
-        En X11/evdev el scan code de Right Ctrl es 105 y su keysym es 65508.
-        El scan code también se mantiene normalmente bajo Wayland/XWayland.
-        """
-        return (
-            event.key() == Qt.Key.Key_Control
-            and (
-                event.nativeScanCode() == 105
-                or event.nativeVirtualKey() in (65508, 0xFFE4)
-            )
-        )
+    def focusNextPrevChild(self, _next: bool) -> bool:  # noqa: N802
+        """Tab no cambia el foco: cursor-agent y otras TUI la necesitan."""
+        return False
 
     def event(self, event) -> bool:
-        """Captura Backtab antes de que QWidget lo use para cambiar el foco."""
+        """Captura Tab/Backtab antes de que QWidget los use para cambiar el foco."""
         if event.type() == QEvent.Type.KeyPress:
-            reverse_tab = (
-                event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
-                and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
-                and not bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
-            )
-            if reverse_tab:
-                self.send_special(b"\x1b[Z")
+            data = tab_sequence(event)
+            if data is not None:
+                self.send_special(data)
                 event.accept()
                 return True
         return super().event(event)
@@ -449,39 +501,63 @@ class TerminalWidget(QWidget):
             QApplication.clipboard().setText(text)
 
     def paste(self) -> None:
-        if not self.session.is_alive():
-            return
         text = QApplication.clipboard().text()
-        if not text:
+        if text:
+            self._write_pasted_text(text, broadcast=True)
+
+    def insert_paths(self, paths: list[str]) -> None:
+        """Pega rutas entrecomilladas en ESTE terminal (imagen, PDF, texto, cualquier archivo)."""
+        existing = [
+            os.path.realpath(path) for path in paths if path and os.path.exists(path)
+        ]
+        quoted = quote_drop_paths(existing)
+        if quoted:
+            self._write_pasted_text(quoted + " ", broadcast=False)
+
+    def _write_pasted_text(self, text: str, *, broadcast: bool) -> None:
+        if not self.session.is_alive() or not text:
             return
         text = text.replace("\r\n", "\r").replace("\n", "\r")
         bracketed = 2004 in getattr(self._screen, "mode", set())
         data = (f"\x1b[200~{text}\x1b[201~" if bracketed else text).encode("utf-8", "replace")
         self.session.write(data)
-        self.inputReady.emit(data)
+        if broadcast:
+            self.inputReady.emit(data)
 
     def select_all(self) -> None:
         self._sel_anchor = (0, 0)
         self._sel_focus = (self._history_len() + self._screen.lines - 1, self._screen.columns - 1)
+        self._sel_visible = True
         self.update()
 
+    def _clear_selection(self) -> None:
+        self._sel_anchor = None
+        self._sel_focus = None
+        self._sel_press = None
+        self._sel_visible = False
+
     def _selection_rows(self) -> tuple[int, int]:
-        if self._sel_anchor is None or self._sel_focus is None:
+        if not self._sel_visible or self._sel_anchor is None or self._sel_focus is None:
             return (0, -1)
         start, end = sorted((self._sel_anchor, self._sel_focus))
         return start[0], end[0]
 
     def selected_text(self) -> str:
-        if self._sel_anchor is None or self._sel_focus is None:
+        if not self._sel_visible or self._sel_anchor is None or self._sel_focus is None:
             return ""
         start, end = sorted((self._sel_anchor, self._sel_focus))
         (r1, c1), (r2, c2) = start, end
         lines: list[str] = []
+        columns = self._screen.columns
         for row in range(r1, r2 + 1):
             chars = self._row_abs(row)
             first = c1 if row == r1 else 0
-            last = c2 if row == r2 else self._screen.columns - 1
-            text = "".join(chars[col].data for col in range(first, min(last + 1, self._screen.columns)))
+            last = c2 if row == r2 else columns - 1
+            first = max(0, min(columns - 1, first))
+            last = max(first, min(columns - 1, last))
+            text = "".join(
+                (chars[col].data or "") for col in range(first, last + 1)
+            )
             lines.append(text.rstrip())
         return "\n".join(lines)
 
@@ -491,42 +567,63 @@ class TerminalWidget(QWidget):
         self._blink_timer.stop()
         self._cursor_on = True
         if event.button() == Qt.MouseButton.LeftButton:
-            cell = self._cell_at(event.position().x(), event.position().y())
-            if cell is not None:
-                self._sel_anchor = cell
-                self._sel_focus = cell
-                self.update()
+            # Un clic para enfocar no es una selección: si pintamos esa celda
+            # queda un cuadrado azul permanente en cada terminal.
+            self._clear_selection()
+            self._sel_press = self._cell_at(event.position().x(), event.position().y())
+            self.update()
         elif event.button() == Qt.MouseButton.MiddleButton:
             self.paste()
         super().mousePressEvent(event)
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
-        if any(url.isLocalFile() and os.path.isdir(url.toLocalFile()) for url in event.mimeData().urls()):
+        if local_drop_paths(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if local_drop_paths(event.mimeData()):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event) -> None:  # noqa: N802
-        for url in event.mimeData().urls():
-            if url.isLocalFile() and os.path.isdir(url.toLocalFile()):
-                self.directoryDropped.emit(os.path.realpath(url.toLocalFile()))
-                event.acceptProposedAction()
-                return
+        files, directories = split_drop_paths(local_drop_paths(event.mimeData()))
+        if files:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.insert_paths(files)
+            self.filesDropped.emit(files)
+            event.acceptProposedAction()
+            return
+        if directories:
+            self.directoryDropped.emit(directories[0])
+            event.acceptProposedAction()
+            return
         event.ignore()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if event.buttons() & Qt.MouseButton.LeftButton and self._sel_anchor is not None:
+        if event.buttons() & Qt.MouseButton.LeftButton and self._sel_press is not None:
             cell = self._cell_at(event.position().x(), event.position().y())
-            if cell is not None and cell != self._sel_focus:
+            if cell is not None and cell != self._sel_press:
+                self._sel_anchor = self._sel_press
                 self._sel_focus = cell
+                self._sel_visible = True
+                self.update()
+            elif cell == self._sel_press and self._sel_visible:
+                self._sel_anchor = None
+                self._sel_focus = None
+                self._sel_visible = False
                 self.update()
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and self._sel_anchor is not None:
-            if self.settings.copy_on_select:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._sel_press = None
+            if self._sel_visible and self.settings.copy_on_select:
                 self.copy_selection()
-            self._blink_timer.start() if self.settings.cursor_blink else None
+            if self.settings.cursor_blink:
+                self._blink_timer.start()
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
@@ -542,8 +639,10 @@ class TerminalWidget(QWidget):
         end = col
         while end < self._screen.columns - 1 and (text[end + 1].isalnum() or text[end + 1] in "._-/"):
             end += 1
+        self._sel_press = None
         self._sel_anchor = (row, start)
         self._sel_focus = (row, end)
+        self._sel_visible = True
         self.update()
 
     def wheelEvent(self, event) -> None:  # noqa: N802
@@ -566,12 +665,15 @@ class TerminalWidget(QWidget):
             self.update()
 
     def _cell_at(self, x: float, y: float) -> tuple[int, int] | None:
+        """Celda bajo el ratón, acotada al grid (así el arrastre al margen coge el final)."""
+        if self._cell_w <= 0 or self._cell_h <= 0 or self._screen.columns < 1:
+            return None
         col = int((x - PAD_X) // self._cell_w)
         row = int((y - PAD_Y) // self._cell_h)
-        if 0 <= col < self._screen.columns and 0 <= row < self._screen.lines:
-            base = self._history_len() - self._scroll_offset
-            return (base + row, col)
-        return None
+        col = max(0, min(self._screen.columns - 1, col))
+        row = max(0, min(self._screen.lines - 1, row))
+        base = self._history_len() - self._scroll_offset
+        return (base + row, col)
 
     # ------------------------------------------------------------------ pintado
     def _row_abs(self, abs_row: int) -> list:
@@ -615,19 +717,24 @@ class TerminalWidget(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         pal = self._palette
-        rect = event.rect()
-        painter.fillRect(rect, self._bg_default)
+        painter.fillRect(self.rect(), self._bg_default)
 
-        cell_w, cell_h = self._cell_w, self._cell_h
-        first = max(0, int((rect.top() - PAD_Y) // cell_h))
-        last = min(self._screen.lines - 1, int((rect.bottom() - PAD_Y) // cell_h))
+        cell_w, cell_h = max(1, int(self._cell_w)), max(1, int(self._cell_h))
+        first = 0
+        last = self._screen.lines - 1
         base = self._history_len() - self._scroll_offset
         sel_rows = self._selection_rows()
-        sel_start, sel_end = sorted((self._sel_anchor, self._sel_focus)) if self._sel_anchor else (None, None)
+        sel_start, sel_end = (
+            sorted((self._sel_anchor, self._sel_focus))
+            if self._sel_visible and self._sel_anchor and self._sel_focus
+            else (None, None)
+        )
 
         for row in range(first, last + 1):
-            y = PAD_Y + row * cell_h
+            y = int(PAD_Y + row * cell_h)
             chars = self._row_abs(base + row)
 
             if sel_start is not None and sel_rows[0] <= base + row <= sel_rows[1]:
@@ -637,14 +744,14 @@ class TerminalWidget(QWidget):
                 if base + row == sel_end[0]:
                     c_to = sel_end[1]
                 painter.fillRect(
-                    QRect(int(PAD_X + c_from * cell_w), int(y), int((c_to - c_from + 1) * cell_w), int(cell_h)),
+                    QRect(int(PAD_X + c_from * cell_w), y, (c_to - c_from + 1) * cell_w, cell_h),
                     self._selection_color,
                 )
 
             run_text: list[str] = []
-            run_x = 0.0
+            run_x = 0
             run_pen = None
-            x = PAD_X
+            x = int(PAD_X)
             for col in range(self._screen.columns):
                 ch = chars[col]
                 if ch.data == "":
@@ -662,7 +769,8 @@ class TerminalWidget(QWidget):
                 x += cell_w
             self._flush_run(painter, run_text, run_x, y, run_pen)
 
-        # Cursor
+        # Cursor: solo en el terminal con foco, y del tamaño exacto de la celda
+        # para no dejar un pixel extra en la celda vecina.
         if (
             self.hasFocus()
             and self._cursor_on
@@ -672,15 +780,17 @@ class TerminalWidget(QWidget):
             cx = self._screen.cursor.x
             cy = self._screen.cursor.y
             if 0 <= cy < self._screen.lines and 0 <= cx < self._screen.columns:
-                rect_cursor = QRect(
-                    int(PAD_X + cx * cell_w), int(PAD_Y + cy * cell_h), int(cell_w) + 1, int(cell_h)
-                )
+                rect_cursor = QRect(int(PAD_X + cx * cell_w), int(PAD_Y + cy * cell_h), cell_w, cell_h)
                 chars = self._row_abs(base + cy)
                 char = chars[cx].data or " "
                 painter.fillRect(rect_cursor, self._cursor_color)
                 painter.setFont(self._font)
                 painter.setPen(self._bg_default)
+                painter.save()
+                painter.setClipRect(rect_cursor, Qt.ClipOperation.IntersectClip)
                 painter.drawText(QPointF(rect_cursor.x(), rect_cursor.y() + self._ascent), char)
+                painter.restore()
+                self._last_cursor = (cx, cy)
 
         if self._scroll_offset:
             label = f"  SCROLL -{self._scroll_offset}  "
@@ -715,11 +825,13 @@ class TerminalWidget(QWidget):
                 self._fg_default if fg_value == "default" else fg
             )
         content = "".join(text)
+        cell_w = max(1, int(self._cell_w))
+        cell_h = max(1, int(self._cell_h))
+        origin_x = int(x)
+        origin_y = int(y)
 
         if bg != self._bg_default or reverse:
-            painter.fillRect(
-                QRect(int(x), int(y), int(len(content) * self._cell_w) + 1, int(self._cell_h) + 1), bg
-            )
+            painter.fillRect(QRect(origin_x, origin_y, len(content) * cell_w, cell_h), bg)
 
         font = self._font
         if bold and italics:
@@ -730,19 +842,27 @@ class TerminalWidget(QWidget):
             font = self._font_italic
         painter.setFont(font)
         painter.setPen(fg)
-        painter.drawText(QPointF(x, y + self._ascent), content)
+        # Un carácter por celda, recortado a ella: si no, el glifo y el cursor
+        # invaden el vecino y quedan manchas al mover el foco.
+        baseline = origin_y + self._ascent
+        for index, glyph in enumerate(content):
+            cell = QRect(origin_x + index * cell_w, origin_y, cell_w, cell_h)
+            painter.save()
+            painter.setClipRect(cell, Qt.ClipOperation.IntersectClip)
+            painter.drawText(QPointF(cell.x(), baseline), glyph)
+            painter.restore()
 
         if underscore or strikethrough:
             pen_line = painter.pen()
             pen_line.setColor(fg)
             painter.setPen(pen_line)
-            width = len(content) * self._cell_w
+            width = len(content) * cell_w
             if underscore:
-                uy = y + self._ascent + 2
-                painter.drawLine(QPointF(x, uy), QPointF(x + width, uy))
+                uy = origin_y + self._ascent + 2
+                painter.drawLine(QPointF(origin_x, uy), QPointF(origin_x + width, uy))
             if strikethrough:
-                sy = y + self._ascent - self._cell_h * 0.28
-                painter.drawLine(QPointF(x, sy), QPointF(x + width, sy))
+                sy = origin_y + self._ascent - cell_h * 0.28
+                painter.drawLine(QPointF(origin_x, sy), QPointF(origin_x + width, sy))
 
     # ------------------------------------------------------------------ foco
     def focusInEvent(self, event) -> None:  # noqa: N802
@@ -758,4 +878,6 @@ class TerminalWidget(QWidget):
     def focusOutEvent(self, event) -> None:  # noqa: N802
         super().focusOutEvent(event)
         self._blink_timer.stop()
+        self._cursor_on = False
+        self._last_cursor = None
         self.update()

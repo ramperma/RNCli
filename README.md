@@ -65,8 +65,8 @@ Los paneles ocultos **no se cierran**: siguen trabajando y los recuperas al camb
 
 Una **pestaña** es una sesión independiente; un **panel** es una terminal visible dentro
 de esa sesión. Para ver agentes que ya abriste en pestañas lado a lado, pulsa
-**⇱ Unir pestañas** en la barra superior (o `Sesión → Convertir todas las pestañas en
-paneles`) y después elige `Diseño → Dos en paralelo`. Si eliges un diseño con varias
+**··· → Convertir pestañas en paneles** (o `Sesión → Convertir pestañas en paneles`)
+y después elige un diseño en la barra (`1`, `2`, `4`…). Si eliges un diseño con varias
 pestañas abiertas, RNCli también te ofrece esa conversión automáticamente.
 
 En enfocar con `Alt+←` / `Alt+→`, el panel activo siempre entra en el diseño visible.
@@ -80,18 +80,25 @@ comparar respuestas. Se desactiva con el mismo atajo.
 La barra de abajo envía texto al panel activo con `Enter`, y con `Ctrl+Enter` lo manda a
 todos (sin necesidad de activar la difusión).
 
-### Explorador de carpetas
+### Explorador
 
-El panel **Carpetas** aparece a la izquierda y se puede arrastrar a la derecha, cerrar o
-volver a abrir desde `Ver → Carpetas` / el botón `📁 Carpetas`.
+El panel **Explorador** aparece a la izquierda y se puede arrastrar a la derecha, cerrar o
+volver a abrir desde `Ver` / el botón **Explorador**.
 
-* Selecciona una carpeta y pulsa **Asignar al terminal activo**.
+* Muestra **carpetas y archivos** (imágenes, PDF, texto o cualquier otro).
+* Arrastra un archivo y suéltalo encima de **un terminal concreto** para pegar su ruta
+  en ese agente. Cada panel recibe solo lo que le sueltas.
+* Selecciona uno o varios archivos y pulsa **Pegar archivo**, o haz doble clic en un archivo.
+* Selecciona una carpeta y pulsa **Usar carpeta**.
 * Doble clic en una carpeta la asigna directamente al terminal activo.
 * Arrastra una carpeta desde el árbol y suéltala encima de cualquier terminal para
   asignarla a ese agente concreto.
 * Al cambiar de directorio, el agente se reinicia en esa carpeta: un proceso ya
   ejecutándose no puede cambiar su `cwd` de forma segura desde fuera.
-* **＋ Nuevo panel aquí** abre el selector de agentes con esa carpeta ya seleccionada.
+* **Nuevo panel** abre el selector de agentes con esa carpeta ya seleccionada.
+* Por defecto **no muestra archivos ocultos** (los que empiezan por `.`). Pulsa `.*` en
+  el explorador, `Ver → Mostrar archivos ocultos` o `Ctrl+H` con el explorador enfocado
+  para verlos u ocultarlos. El ajuste se guarda.
 
 ### Otros atajos
 | Atajo | Acción |
@@ -100,7 +107,9 @@ volver a abrir desde `Ver → Carpetas` / el botón `📁 Carpetas`.
 | `F2` | Renombrar pestaña |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Pestaña siguiente / anterior |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copiar / pegar |
+| **Tab** / **Shift+Tab** | Siempre al terminal seleccionado (cursor-agent, Pi…) |
 | **Ctrl derecho** | Host Key tipo VirtualBox: libera el foco de la terminal y activa los atajos de RNCli |
+| **Escape** | Configurable en Ajustes: al terminal o Host Key |
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal (también la rueda) |
 | `Ctrl+Shift+R` | Reiniciar el agente activo (`Enter` en una terminal terminada) |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Tamaño de letra |
@@ -135,7 +144,7 @@ que copia la ruta al portapapeles). Formato:
       "env": { "GEMINI_API_KEY": "tu_clave_aquí" }
     }
   ],
-  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1" }
+  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1", "escape_key": "terminal" }
 }
 ```
 
@@ -161,20 +170,22 @@ Si aun así no lo encuentra, pon la ruta absoluta en el agente:
 
 ## Sesión y ajustes
 
-* **Ajustes** (⚙): fuente, tamaño, tema (Oscuro/Dracula/Claro), líneas de historial,
-  diseño inicial, agente por defecto, carpeta inicial, cursor parpadeante y
-  «recordar sesión al reiniciar» (pestañas, paneles, agentes y geometría).
+* **Ajustes**: fuente, tamaño, tema (Oscuro / Dracula / Claro / Grafito), líneas de historial,
+  diseño inicial, agente por defecto, carpeta inicial, tecla Escape (al terminal o Host Key),
+  cursor parpadeante y «recordar sesión al reiniciar» (pestañas, paneles, agentes y geometría).
 * Todo se guarda en `~/.config/rncli/`:
   `config.json` (ajustes y agentes) y `session.json` (sesión, si la activas).
 * Si algo va mal, el registro de errores está en `~/.config/rncli/rncli.log`.
 
 ## sudo para los agentes
 
-El botón **🔑 sudo** abre un asistente con las estrategias de
-[`sudo-config-strategies.md`](sudo-config-strategies.md) resumidas: genera el fragmento
-de `sudoers` para tu usuario, lo copia al portapapeles y comprueba con
-`sudo -n true` si sudo ya funciona sin contraseña. RNCli **nunca** modifica
-`/etc/sudoers`: tú copias el fragmento y lo pegas con `sudo visudo`.
+El menú **··· → Sudo para agentes** abre un asistente con las estrategias de
+[`sudo-config-strategies.md`](sudo-config-strategies.md). Para cada una genera **el
+comando bash entero** (escribe un archivo en `/etc/sudoers.d/`, lo valida con
+`visudo -cf` y lista permisos). Puedes **copiarlo** o pulsar **Enviar a un Bash**
+para pegarlo en un panel Bash de RNCli; sudo pedirá tu contraseña ahí una vez.
+**Comprobar sudo** ejecuta `sudo -n true`. RNCli **nunca** modifica `/etc/sudoers`
+directamente.
 
 Las dos estrategias recomendadas por el manual para trabajar con agentes son la 1
 (`Defaults timestamp_timeout=90`) y la 2 (`NOPASSWD` para comandos concretos).
@@ -208,10 +219,11 @@ Las dos estrategias recomendadas por el manual para trabajar con agentes son la 
 ### Host Key tipo VirtualBox
 
 Cuando una TUI tiene el foco, sus atajos tienen prioridad: por ejemplo, `Ctrl+T` de
-OpenCode y `Shift+Tab` de Pi llegan al agente y no los roba RNCli. Pulsa **Ctrl derecho**
-solo cuando quieras usar los atajos del chasis (`Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`,
-`Alt+2`, etc.). Eso activa `MODO RNCli`; haz clic en cualquier terminal para volver a
-escribir en ella.
+OpenCode, `Tab` de cursor-agent y `Shift+Tab` de Pi llegan al agente y no los roba RNCli.
+Pulsa **Ctrl derecho** (o **Escape**, si lo activas en Ajustes → Tecla Escape) solo cuando
+quieras usar los atajos del chasis (`Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`, `Alt+2`, etc.).
+Eso activa `MODO RNCli`; haz clic en cualquier terminal o pulsa la Host Key otra vez para
+volver a escribir en ella.
 
 ### La pantalla «New session» de OpenCode
 
@@ -239,13 +251,13 @@ rncli/
 ├── theme.py         # temas Oscuro / Dracula / Claro
 run.sh               # arranque con venv automático
 install.sh           # entrada en el menú de aplicaciones
-tests/smoke_test.py  # 32 comprobaciones sin pantalla
+tests/smoke_test.py  # comprobaciones sin pantalla
 ```
 
 ## Pruebas
 
 ```bash
-.venv/bin/python tests/smoke_test.py --screenshot /tmp/rncli.png   # funcionalidad (32)
+.venv/bin/python tests/smoke_test.py --screenshot /tmp/rncli.png   # funcionalidad
 .venv/bin/python tests/desktop_env_test.py                        # arranque desde el menú
 ./tests/cierre_test.sh                                            # sin agentes huérfanos
 ```
@@ -253,7 +265,8 @@ tests/smoke_test.py  # 32 comprobaciones sin pantalla
 * `smoke_test.py` comprueba que los paneles arrancan, que la terminal interpreta color y
   salida real, los diseños, la difusión (una orden ejecutada de verdad en otro panel), el
   historial, el portapapeles, el guardado y la restauración de la sesión, los ajustes en
-  caliente y los fragmentos de sudo. En total 32 comprobaciones.
+  caliente, los fragmentos de sudo, que Tab llega al terminal seleccionado y que se pueden
+  soltar archivos (imagen, PDF, texto) en un terminal.
 * `desktop_env_test.py` lanza RNCli con un PATH mínimo (como hace el escritorio) y
   verifica que encuentra `opencode`, `pi`, `git`… y que la TUI de opencode arranca.
 * `cierre_test.sh` arranca la aplicación, toma su PID real de la ventana X11 y comprueba

@@ -31,6 +31,7 @@ class PaneWidget(QFrame):
     hostKeyRequested = Signal(object)
     userFocusRequested = Signal(object)
     directoryDropped = Signal(object, str)
+    filesDropped = Signal(object, list)
 
     def __init__(self, agent: Agent, settings, cwd: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -43,7 +44,7 @@ class PaneWidget(QFrame):
         self._grave: list[PtySession] = []
 
         self.setObjectName("Pane")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self._build_header()
@@ -53,41 +54,54 @@ class PaneWidget(QFrame):
     def _build_header(self) -> None:
         self.header = QWidget(self)
         self.header.setObjectName("PaneHeader")
-        self.header.setFixedHeight(26)
+        self.header.setFixedHeight(34)
         layout = QHBoxLayout(self.header)
-        layout.setContentsMargins(6, 0, 4, 0)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 0, 6, 0)
+        layout.setSpacing(8)
 
         self.dot = QLabel("●", self.header)
-        self.dot.setStyleSheet(f"color: {self.agent.color}; font-size: 12px;")
+        self.dot.setStyleSheet(f"color: {self.agent.color}; font-size: 11px;")
+        self.dot.setFixedWidth(14)
 
         self.name_label = QLabel(self.agent.name, self.header)
         self.name_label.setObjectName("PaneTitle")
+        self.name_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+
+        self.path_label = QLabel("", self.header)
+        self.path_label.setObjectName("PanePath")
+        self.path_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.path_label.setMaximumWidth(220)
 
         self.status_label = QLabel("", self.header)
         self.status_label.setObjectName("PaneStatus")
 
-        self.broadcast_label = QLabel("⇢ difusión", self.header)
+        self.broadcast_label = QLabel("difusión", self.header)
         self.broadcast_label.setObjectName("PaneBroadcast")
         self.broadcast_label.setVisible(False)
 
         self.restart_button = QToolButton(self.header)
+        self.restart_button.setObjectName("PaneButton")
         self.restart_button.setText("↻")
         self.restart_button.setToolTip("Reiniciar el agente (Enter en la terminal también lo reinicia)")
         self.restart_button.setAutoRaise(True)
+        self.restart_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.restart_button.setFixedSize(24, 24)
         self.restart_button.clicked.connect(self.restart)
 
         self.close_button = QToolButton(self.header)
+        self.close_button.setObjectName("PaneClose")
         self.close_button.setText("✕")
         self.close_button.setToolTip("Cerrar este panel (Ctrl+W)")
         self.close_button.setAutoRaise(True)
+        self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.close_button.setFixedSize(24, 24)
         self.close_button.clicked.connect(lambda: self.closeRequested.emit(self))
 
         layout.addWidget(self.dot)
         layout.addWidget(self.name_label)
+        layout.addWidget(self.path_label, 1)
         layout.addWidget(self.status_label)
         layout.addWidget(self.broadcast_label)
-        layout.addStretch(1)
         layout.addWidget(self.restart_button)
         layout.addWidget(self.close_button)
 
@@ -122,9 +136,12 @@ class PaneWidget(QFrame):
         self.terminal.hostKeyPressed.connect(lambda: self.hostKeyRequested.emit(self))
         self.terminal.userFocusReceived.connect(lambda: self.userFocusRequested.emit(self))
         self.terminal.directoryDropped.connect(self._on_directory_drop)
+        self.terminal.filesDropped.connect(self._on_files_drop)
         self.body_layout.addWidget(self.terminal)
         self.session.exited.connect(self._on_exited)
         self._set_status("")
+        self._refresh_header()
+        self.apply_theme(self.settings.theme)
         self.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _teardown(self) -> None:
@@ -162,6 +179,11 @@ class PaneWidget(QFrame):
         self.status_label.setText(text)
         self.status_label.setVisible(bool(text))
 
+    def _refresh_header(self) -> None:
+        base = os.path.basename(self.cwd.rstrip(os.sep)) or self.cwd
+        self.path_label.setText(base)
+        self.path_label.setToolTip(self.cwd)
+
     def _on_exited(self, code: int) -> None:
         if self.sender() is not self.session:
             return  # evento de una sesión ya reemplazada
@@ -187,7 +209,9 @@ class PaneWidget(QFrame):
     def _on_bell(self) -> None:
         """Aviso visual breve cuando el agente lanza un BEL."""
         pal = theme(self.settings.theme)
-        self.setStyleSheet(f"#Pane {{ border: 1px solid {pal['brightbrown']}; background: {pal['bg']}; }}")
+        self.setStyleSheet(
+            f"#Pane {{ border: 1px solid {pal['brightbrown']}; border-radius: 8px; background: {pal['bg']}; }}"
+        )
         QTimer.singleShot(220, lambda: self.set_active(self.property("rncliActive") is True))
 
     def _on_input(self, data: bytes) -> None:
@@ -196,11 +220,15 @@ class PaneWidget(QFrame):
     def _on_directory_drop(self, path: str) -> None:
         self.directoryDropped.emit(self, path)
 
+    def _on_files_drop(self, paths: list) -> None:
+        self.filesDropped.emit(self, list(paths))
+
     def assign_directory(self, path: str) -> None:
         """Cambia el cwd del agente reiniciándolo en la carpeta elegida."""
         if not os.path.isdir(path):
             return
         self.cwd = os.path.realpath(path)
+        self._refresh_header()
         self._set_status(f"abriendo · {os.path.basename(self.cwd) or self.cwd}")
         self.restart()
 
@@ -211,21 +239,23 @@ class PaneWidget(QFrame):
     def apply_settings(self, settings, theme_name: str) -> None:
         self.settings = settings
         if self.terminal is not None:
+            self.terminal.settings = settings
             self.terminal.set_font(settings.font_family, settings.font_size)
             self.terminal.set_theme(theme_name)
         self.apply_theme(theme_name)
 
     def apply_theme(self, theme_name: str) -> None:
         pal = theme(theme_name)
+        muted = pal.get("muted", pal["header_fg"])
+        surface = pal.get("surface", pal["header_bg"])
         self.header.setStyleSheet(
-            f"#PaneHeader {{ background: {pal['header_bg']}; }}"
+            f"#PaneHeader {{ background: {surface}; border-top-left-radius: 8px; "
+            f"border-top-right-radius: 8px; }}"
             f"#PaneTitle {{ color: {pal['fg']}; font-weight: 600; }}"
-            f"#PaneStatus {{ color: {pal['brightblack']}; }}"
+            f"#PaneStatus, #PanePath {{ color: {muted}; }}"
             f"#PaneBroadcast {{ color: {pal['accent']}; font-weight: 600; }}"
         )
-        self.setStyleSheet(
-            f"#Pane {{ border: 1px solid {pal['border']}; background: {pal['bg']}; }}"
-        )
+        self.set_active(self.property("rncliActive") is True)
 
     def set_broadcast(self, enabled: bool) -> None:
         self.broadcast_label.setVisible(enabled)
@@ -235,7 +265,7 @@ class PaneWidget(QFrame):
         pal = theme(self.settings.theme)
         color = pal["accent"] if active else pal["border"]
         self.setStyleSheet(
-            f"#Pane {{ border: 1px solid {color}; background: {pal['bg']}; }}"
+            f"#Pane {{ border: 1px solid {color}; border-radius: 8px; background: {pal['bg']}; }}"
         )
 
     def send(self, data: bytes) -> None:
