@@ -1,0 +1,15 @@
+[package]
+name = "rncli_native"
+version = "0.1.0"
+edition = "2021"
+description = "PTY y emulador VT nativos para RNCli (PyO3)"
+
+[lib]
+name = "rncli_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+alacritty_terminal = "0.25.1"
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "process", "signal", "term"] }
+pyo3 = { version = "0.25", features = ["extension-module"] }

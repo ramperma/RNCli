@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "rncli-native"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "PTY y emulador VT nativos para RNCli"
+
+[tool.maturin]
+module-name = "rncli_native"
+manifest-path = "Cargo.toml"

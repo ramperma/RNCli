@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 .ruff_cache/
+native/target/
+*.so
+.kimetsu/

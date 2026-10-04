@@ -1,4 +1,4 @@
-"""Widget de terminal: emula un VT100 con pyte y lo dibuja con QPainter."""
+"""Widget de terminal: emula un VT100 (Rust/alacritty o pyte) y lo dibuja con QPainter."""
 
 from __future__ import annotations
 
@@ -7,12 +7,12 @@ import os
 import re
 import shlex
 
-import pyte
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .theme import brighten, resolve_color, theme
+from .vt_engine import make_engine
 
 PAD_X = 6
 PAD_Y = 4
@@ -146,10 +146,9 @@ class TerminalWidget(QWidget):
         self.session = session
         self.settings = settings
 
-        self._screen = pyte.HistoryScreen(80, 24, history=int(settings.scrollback), ratio=0.5)
-        self._stream = pyte.ByteStream(self._screen)
+        self._engine = make_engine(80, 24, int(settings.scrollback))
+        self._screen = self._engine.screen
         self._scroll_offset = 0
-        self._blank = pyte.screens.Char(" ")
         self._last_title = ""
         self._bell_pending = False
         self._raw_tail = b""
@@ -191,7 +190,7 @@ class TerminalWidget(QWidget):
         self.setMouseTracking(True)
 
         # Campana: si pyte expone `bell` como método, lo interceptamos.
-        if callable(getattr(self._screen, "bell", None)):
+        if not self._engine.native and callable(getattr(self._screen, "bell", None)):
             self._screen.bell = self._emit_bell  # type: ignore[method-assign]
 
         session.dataReceived.connect(self._feed)
@@ -251,8 +250,8 @@ class TerminalWidget(QWidget):
     def _apply_size(self) -> None:
         cols = max(2, int((self.width() - 2 * PAD_X) // self._cell_w))
         rows = max(2, int((self.height() - 2 * PAD_Y) // self._cell_h))
-        if (cols, rows) != (self._screen.columns, self._screen.lines):
-            self._screen.resize(lines=rows, columns=cols)
+        if (cols, rows) != (self._engine.columns(), self._engine.lines()):
+            self._engine.resize(cols, rows)
             self.session.resize(cols, rows)
             self._scroll_offset = min(self._scroll_offset, self._history_len())
             self.sizeChanged.emit(cols, rows)
@@ -290,7 +289,7 @@ class TerminalWidget(QWidget):
         return self._history_len()
 
     def _history_len(self) -> int:
-        return len(self._screen.history.top)
+        return self._engine.history_len()
 
     # ------------------------------------------------------------------ entrada
     @staticmethod
@@ -337,24 +336,26 @@ class TerminalWidget(QWidget):
 
     def _feed(self, data: bytes) -> None:
         before = self._history_len()
-        data, self._raw_tail = self.sanitize(data, self._raw_tail)
+        if not self._engine.native:
+            data, self._raw_tail = self.sanitize(data, self._raw_tail)
         if not data:
             return
         try:
-            self._stream.feed(data)
+            replies = self._engine.feed(data)
         except Exception:
             return
+        if replies:
+            self.session.write(replies)
         grown = self._history_len() - before
         if self._scroll_offset > 0 and grown:
             # mantenemos a la vista el mismo contenido mientras llega salida nueva
             self._scroll_offset = min(self._history_len(), self._scroll_offset + grown)
 
-        if not callable(getattr(self._screen, "bell", None)) and getattr(self._screen, "bell", False):
-            self._screen.bell = False
+        if self._engine.take_bell():
             self._emit_bell()
 
-        title = getattr(self._screen, "title", None)
-        if isinstance(title, str) and title and title != self._last_title:
+        title = self._engine.title()
+        if title and title != self._last_title:
             self._last_title = title
             self.titleChanged.emit(title)
 
@@ -678,19 +679,7 @@ class TerminalWidget(QWidget):
     # ------------------------------------------------------------------ pintado
     def _row_abs(self, abs_row: int) -> list:
         """Fila (histórica o viva) como lista de Char, una por columna."""
-        cols = self._screen.columns
-        if abs_row < 0:
-            return [self._blank] * cols
-        hist = self._screen.history.top
-        hlen = len(hist)
-        if abs_row < hlen:
-            row = hist[abs_row]
-            return [row.get(col, self._blank) for col in range(cols)]
-        y = abs_row - hlen
-        if 0 <= y < self._screen.lines:
-            row = self._screen.buffer[y]
-            return [row[col] for col in range(cols)]
-        return [self._blank] * cols
+        return self._engine.row(abs_row)
 
     def _fg(self, value, bold: bool, bright_variant: str | None) -> QColor:
         key = (value, bold)

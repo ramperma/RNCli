@@ -401,6 +401,13 @@ def app_stylesheet(name: str) -> str:
         border: none;
         width: 22px;
     }}
+    QComboBox QAbstractItemView {{
+        background: {raised};
+        color: {pal['fg']};
+        selection-background-color: {pal['selection']};
+        selection-color: {pal['fg']};
+        border: 1px solid {pal['border']};
+    }}
 
     QPushButton {{
         background: {raised};

@@ -91,7 +91,15 @@ def main(argv: list[str] | None = None) -> int:
     try:
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(f"[{APP_NAME} {__version__}] PATH detectado: {detected_path}\n")
+            handle.write(
+                f"[{APP_NAME} {__version__}] PATH detectado: {detected_path}\n"
+            )
+            from .vt_engine import NATIVE
+
+            handle.write(
+                f"[{APP_NAME} {__version__}] motor de terminal: "
+                f"{'nativo (Rust/alacritty)' if NATIVE else 'pyte'}\n"
+            )
     except OSError:
         pass
 

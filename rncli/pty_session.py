@@ -14,6 +14,7 @@ import termios
 from PySide6.QtCore import QObject, QSocketNotifier, QTimer, Signal
 
 from .shell_env import login_path, resolve_executable
+from .vt_engine import NATIVE, spawn_native_pty
 
 _SPAWN_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_spawn.py")
 
@@ -49,6 +50,7 @@ class PtySession(QObject):
         self.pid: int | None = None
         self.returncode: int | None = None
         self._proc: subprocess.Popen | None = None
+        self._native = None
 
         self._master: int = -1
         self._read_notifier: QSocketNotifier | None = None
@@ -62,19 +64,38 @@ class PtySession(QObject):
 
     # ------------------------------------------------------------------ arranque
     def _start(self, env: dict[str, str]) -> None:
-        master, slave = pty.openpty()
-        self._set_winsize(master, self.cols, self.rows)
-
-        command = [_python(), _SPAWN_HELPER, "--cwd", self.cwd]
-        env = {"PATH": login_path(), **env}  # el agente ve el PATH del usuario
-        for key, value in env.items():
-            command += ["--env", f"{key}={value}"]
-        command += ["--", *self.argv]
-
         child_env = os.environ.copy()
         child_env.setdefault("TERM", "xterm-256color")
         child_env.setdefault("COLORTERM", "truecolor")
         child_env.setdefault("TERM_PROGRAM", "rncli")
+        extra = {"PATH": login_path(), **env}
+
+        if NATIVE:
+            merged = {**child_env, **extra}
+            try:
+                self._native = spawn_native_pty(
+                    self.argv, self.cwd, merged, self.cols, self.rows
+                )
+            except OSError as exc:
+                self._fail(str(exc))
+                return
+            if self._native is not None:
+                self.pid = int(self._native.pid())
+                self._master = int(self._native.fileno())
+                self._read_notifier = QSocketNotifier(self._master, QSocketNotifier.Type.Read, self)
+                self._read_notifier.activated.connect(self._on_readable)
+                self._write_notifier = QSocketNotifier(self._master, QSocketNotifier.Type.Write, self)
+                self._write_notifier.activated.connect(self._on_writable)
+                self._write_notifier.setEnabled(False)
+                return
+
+        master, slave = pty.openpty()
+        self._set_winsize(master, self.cols, self.rows)
+
+        command = [_python(), _SPAWN_HELPER, "--cwd", self.cwd]
+        for key, value in extra.items():
+            command += ["--env", f"{key}={value}"]
+        command += ["--", *self.argv]
 
         try:
             self._proc = subprocess.Popen(
@@ -122,7 +143,13 @@ class PtySession(QObject):
             return
         while True:
             try:
-                chunk = os.read(self._master, 65536)
+                if self._native is not None:
+                    chunk = self._native.read(65536)
+                    if chunk is None:
+                        return
+                    chunk = bytes(chunk)
+                else:
+                    chunk = os.read(self._master, 65536)
             except BlockingIOError:
                 return
             except OSError:
@@ -145,10 +172,16 @@ class PtySession(QObject):
             except RuntimeError:
                 pass  # el objeto C++ ya había sido destruido
         if self._master >= 0:
-            try:
-                os.close(self._master)
-            except OSError:
-                pass
+            if self._native is not None:
+                try:
+                    self._native.close()
+                except Exception:
+                    pass
+            else:
+                try:
+                    os.close(self._master)
+                except OSError:
+                    pass
             self._master = -1
 
     def _schedule_reap(self) -> None:
@@ -160,6 +193,16 @@ class PtySession(QObject):
         self._reap_timer.start()
 
     def _reap(self) -> None:
+        if self._native is not None:
+            code = self._native.poll()
+            if code is None:
+                return
+            if self._reap_timer is not None:
+                self._reap_timer.stop()
+            self._dead = True
+            self.returncode = int(code)
+            self.exited.emit(int(code))
+            return
         if self._proc is None or self._proc.poll() is None:
             return
         if self._reap_timer is not None:
@@ -178,7 +221,13 @@ class PtySession(QObject):
     def _flush(self) -> None:
         while self._pending and self._master >= 0:
             try:
-                written = os.write(self._master, bytes(self._pending))
+                if self._native is not None:
+                    written = int(self._native.write(bytes(self._pending)))
+                    if written == 0:
+                        self._enable_write_notifier(True)
+                        return
+                else:
+                    written = os.write(self._master, bytes(self._pending))
             except BlockingIOError:
                 self._enable_write_notifier(True)
                 return
@@ -216,15 +265,28 @@ class PtySession(QObject):
             return
         self.cols, self.rows = cols, rows
         if self._master >= 0:
-            self._set_winsize(self._master, cols, rows)  # el kernel envía SIGWINCH
+            if self._native is not None:
+                self._native.resize(cols, rows)
+            else:
+                self._set_winsize(self._master, cols, rows)  # el kernel envía SIGWINCH
 
     def is_alive(self) -> bool:
+        if self._native is not None:
+            return not self._dead and self._native.poll() is None
         return self._proc is not None and not self._dead and self._proc.poll() is None
 
     def terminate(self, force_after_ms: int = 900) -> None:
         """SIGTERM al grupo de procesos y, si se resiste, SIGKILL."""
         pid = self.pid
         if pid is None or self._dead:
+            return
+        if self._native is not None:
+            self._native.terminate()
+            self._pending.clear()
+            self._kill_timer = QTimer(self)
+            self._kill_timer.setSingleShot(True)
+            self._kill_timer.timeout.connect(lambda: self._force_kill(pid))
+            self._kill_timer.start(force_after_ms)
             return
         try:
             pgid = os.getpgid(pid)
@@ -247,6 +309,11 @@ class PtySession(QObject):
         self._kill_timer.start(force_after_ms)
 
     def _force_kill(self, pgid: int) -> None:
+        if self._native is not None:
+            if self._native.poll() is not None:
+                return
+            self._native.kill()
+            return
         if self._proc is None or self._proc.poll() is not None:
             return
         try:
@@ -261,6 +328,10 @@ class PtySession(QObject):
         """Cierre inmediato (al cerrar la aplicación)."""
         pid = self.pid
         if pid is None:
+            return
+        if self._native is not None:
+            self._native.kill()
+            self._shutdown_io()
             return
         try:
             pgid = os.getpgid(pid)
