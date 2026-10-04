@@ -20,7 +20,8 @@ la vez**. También puedes abrir **sesiones SSH** a equipos remotos en sus propia
 ## Arranque rápido
 
 ```bash
-./run.sh                 # crea el venv, instala PySide6+pyte y abre RNCli
+# crea el venv, instala PySide6+pyte, compila el motor nativo si hay Rust y abre RNCli
+./run.sh
 ```
 
 Opciones útiles:
@@ -224,11 +225,31 @@ directamente.
 Las dos estrategias recomendadas por el manual para trabajar con agentes son la 1
 (`Defaults timestamp_timeout=90`) y la 2 (`NOPASSWD` para comandos concretos).
 
+## Motor nativo (Rust, opcional)
+
+El PTY y el emulador VT tienen una implementación nativa en Rust (crate PyO3
+`rncli_native`, con `nix` y `alacritty_terminal`). **Es opcional**: si no está
+compilado, RNCli funciona igual usando pyte y el pty de Python.
+
+`./run.sh` lo compila automáticamente la primera vez si encuentra `cargo` (lo busca
+también en `~/.cargo/bin`), instalando `maturin` en el venv. Para compilarlo a mano:
+
+```bash
+.venv/bin/pip install maturin
+VIRTUAL_ENV="$PWD/.venv" .venv/bin/python -m maturin develop --release \
+    --manifest-path native/Cargo.toml
+```
+
+La elección del motor se anota en `~/.config/rncli/rncli.log` (*nativo* o *pyte*). Si
+quieres volver a pyte sin desinstalar nada, borra el `.so` de `rncli_native`
+(o arranca sin el módulo importable).
+
 ## Detalles técnicos
 
-* Cada panel es un **pty real** (`_spawn.py` hace `setsid()` + `TIOCSCTTY` + `execvp`),
-  así que Ctrl+C, Ctrl+Z, `SIGWINCH` al redimensionar y las TUI funcionan igual que en
-  una terminal normal.
+* Cada panel es un **pty real**. Con el motor nativo lo crea Rust
+  (`native/src/pty.rs`: `setsid()` + `TIOCSCTTY` + `execvp`); si no está compilado,
+  `_spawn.py` hace lo mismo desde Python. Ctrl+C, Ctrl+Z, `SIGWINCH` al redimensionar y
+  las TUI funcionan igual que en una terminal normal.
 * Los agentes se lanzan con el PATH del usuario y con `PR_SET_PDEATHSIG`: si RNCli se
   cierra (incluso con `kill -9`), ningún agente se queda huérfano.
 * El emulador se dibuja con `QPainter` (rejilla de celdas, 16 colores, 256 colores y
@@ -249,8 +270,8 @@ Las dos estrategias recomendadas por el manual para trabajar con agentes son la 
 
 ### Limitaciones conocidas
 
-* No se envían eventos de ratón a las TUI (pyte no implementa el protocolo); el ratón
-  se usa para seleccionar texto, pegar (botón central) y desplazar el historial.
+* No se envían eventos de ratón a las TUI; el ratón se usa para seleccionar texto,
+  pegar (botón central) y desplazar el historial.
 * No hay soporte de imágenes (sixel/kitty graphics).
 * Los atajos con `Alt` son de RNCli, así que no llegan a los agentes.
 
@@ -293,6 +314,7 @@ rncli/
 run.sh               # arranque con venv automático
 install.sh           # entrada en el menú de aplicaciones
 tests/smoke_test.py  # comprobaciones sin pantalla
+tests/native_test.py # pruebas del motor nativo (se omiten si no está compilado)
 ```
 
 ## Pruebas
@@ -300,6 +322,7 @@ tests/smoke_test.py  # comprobaciones sin pantalla
 ```bash
 .venv/bin/python tests/smoke_test.py --screenshot /tmp/rncli.png   # funcionalidad
 .venv/bin/python tests/desktop_env_test.py                        # arranque desde el menú
+.venv/bin/python tests/native_test.py                             # motor nativo (si compilado)
 ./tests/cierre_test.sh                                            # sin agentes huérfanos
 ```
 
@@ -315,3 +338,4 @@ tests/smoke_test.py  # comprobaciones sin pantalla
   que al cerrarla (SIGTERM y `kill -9`) no queda ningún agente vivo.
 
 [pyte]: https://github.com/selectel/pyte
+[alacritty_terminal]: https://github.com/alacritty/alacritty

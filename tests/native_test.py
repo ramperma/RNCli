@@ -22,10 +22,10 @@ def check(condition: bool, description: str) -> None:
 
 
 def main() -> int:
-    check(NATIVE, "el módulo rncli_native está importable")
     if not NATIVE:
-        print("motor nativo no compilado; se omite el resto")
+        print("[skip] motor nativo no compilado; se omite el resto")
         return 0
+    check(NATIVE, "el módulo rncli_native está importable")
 
     engine = make_engine(80, 24, 500)
     engine.feed(b"\x1b[1;32mHOLA-NATIVO\x1b[0m\r\n")

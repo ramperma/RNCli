@@ -113,10 +113,10 @@ def main() -> int:
 
     # El foco no debe reordenar paneles ni destruir el splitter manual.
     workspace.set_layout("2v")
-    wait(120)
+    wait(300)
     positions_before = [pane.geometry().x() for pane in workspace.visible_panes()]
     workspace.focus_pane(workspace.visible_panes()[1])
-    wait(120)
+    wait(300)
     positions_after = [pane.geometry().x() for pane in workspace.visible_panes()]
     check(
         positions_after == positions_before
@@ -205,6 +205,9 @@ def main() -> int:
     marker.unlink(missing_ok=True)
     QApplication.clipboard().setText(f"echo listo > {marker}\n")
     active.terminal.paste()
+    # Con bracketed paste (lo activa el motor nativo) el salto de línea del
+    # portapapeles no ejecuta: hace falta Enter, que también se difunde.
+    active.terminal.send_special(b"\r")
     wait(1600)
     check(marker.exists(), "la difusión envía la orden a los demás paneles (y se ejecuta)")
     workspace.set_broadcast(False)

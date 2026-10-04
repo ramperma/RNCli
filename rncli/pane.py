@@ -159,6 +159,9 @@ class PaneWidget(QFrame):
                 old_session.exited.disconnect(self._on_exited)
             except (RuntimeError, TypeError):
                 pass
+            # Sin esto, reiniciar (↻, Ctrl+Shift+R o cambio de carpeta) dejaba
+            # el agente anterior vivo en segundo plano.
+            old_session.terminate(force_after_ms=600)
             self._grave.append(old_session)
             QTimer.singleShot(4000, lambda s=old_session: self._prune_grave(s))
 

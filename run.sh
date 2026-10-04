@@ -24,7 +24,7 @@ if [ -x "$HOME/.cargo/bin/cargo" ] || command -v cargo >/dev/null 2>&1; then
   if ! "$VENV/bin/python" -c "import rncli_native" >/dev/null 2>&1; then
     echo "[rncli] compilando motor nativo (Rust)..."
     if "$VENV/bin/python" -m pip install -q maturin \
-      && (cd "$ROOT/native" && "$VENV/bin/python" -m maturin develop --release); then
+      && (cd "$ROOT/native" && VIRTUAL_ENV="$VENV" "$VENV/bin/python" -m maturin develop --release); then
       echo "[rncli] motor nativo listo"
     else
       echo "[rncli] no se pudo compilar el motor nativo; se usará pyte"

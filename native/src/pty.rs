@@ -1,14 +1,14 @@
 //! PTY Linux: setsid + TIOCSCTTY + PR_SET_PDEATHSIG + exec, sin helper de Python.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::os::fd::{IntoRawFd, RawFd};
-use std::path::Path;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::{openpty, Winsize};
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, dup2, execvp, fork, setsid, ForkResult, Pid};
+use nix::unistd::{fork, ForkResult, Pid};
 use pyo3::exceptions::PyOSError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -46,59 +46,114 @@ fn set_winsize(fd: RawFd, cols: u16, rows: u16) {
     }
 }
 
-fn child_exec(
-    slave_fd: RawFd,
-    argv: &[String],
-    cwd: &str,
-    env: &HashMap<String, String>,
-) -> ! {
-    let _ = setsid();
+/// Todo lo que el proceso hijo necesita tras el `fork`, reservado de antemano.
+///
+/// Entre `fork()` y `execvpe()` solo se permiten operaciones async-signal-safe;
+/// por eso las cadenas, el entorno y los mensajes de error se construyen aquí.
+struct ChildPlan {
+    // `argv` y `env` solo se conservan para que los punteros sigan siendo válidos.
+    #[allow(dead_code)]
+    argv: Vec<CString>,
+    argv_ptrs: Vec<*const libc::c_char>,
+    #[allow(dead_code)]
+    env: Vec<CString>,
+    env_ptrs: Vec<*const libc::c_char>,
+    cwd: Option<CString>,
+    not_found: CString,
+    permission: CString,
+    failed: CString,
+}
+
+impl ChildPlan {
+    fn build(argv: &[String], cwd: &str, env: &HashMap<String, String>) -> Result<Self, String> {
+        if argv.is_empty() {
+            return Err("falta el comando a ejecutar".into());
+        }
+        let argv_c = argv
+            .iter()
+            .map(|part| CString::new(part.as_str()).map_err(|_| "argumento con byte nulo"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut argv_ptrs: Vec<*const libc::c_char> =
+            argv_c.iter().map(|part| part.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+
+        let env_c = env
+            .iter()
+            .map(|(key, value)| {
+                CString::new(format!("{key}={value}"))
+                    .map_err(|_| "variable de entorno con byte nulo")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut env_ptrs: Vec<*const libc::c_char> =
+            env_c.iter().map(|entry| entry.as_ptr()).collect();
+        env_ptrs.push(std::ptr::null());
+
+        let cwd = if cwd.is_empty() {
+            None
+        } else {
+            Some(CString::new(cwd).map_err(|_| "cwd con byte nulo")?)
+        };
+
+        let not_found =
+            CString::new(format!("\r\n[rncli] no se encontró el comando '{}'\r\n", argv[0]))
+                .unwrap();
+        let permission =
+            CString::new(format!("\r\n[rncli] sin permisos para ejecutar '{}'\r\n", argv[0]))
+                .unwrap();
+        let failed =
+            CString::new(format!("\r\n[rncli] no se pudo ejecutar '{}'\r\n", argv[0])).unwrap();
+
+        Ok(Self {
+            argv: argv_c,
+            argv_ptrs,
+            env: env_c,
+            env_ptrs,
+            cwd,
+            not_found,
+            permission,
+            failed,
+        })
+    }
+}
+
+fn child_exec(slave_fd: RawFd, plan: &ChildPlan) -> ! {
+    let _ = unsafe { libc::setsid() };
     unsafe {
         libc::ioctl(slave_fd, libc::TIOCSCTTY, 0);
         libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
         if libc::getppid() <= 1 {
             libc::kill(libc::getpid(), libc::SIGKILL);
         }
+        libc::dup2(slave_fd, 0);
+        libc::dup2(slave_fd, 1);
+        libc::dup2(slave_fd, 2);
     }
-    let _ = dup2(slave_fd, 0);
-    let _ = dup2(slave_fd, 1);
-    let _ = dup2(slave_fd, 2);
     if slave_fd > 2 {
-        let _ = close(slave_fd);
-    }
-    if !cwd.is_empty() {
-        let path = Path::new(cwd);
-        if path.is_dir() {
-            let _ = nix::unistd::chdir(path);
+        unsafe {
+            libc::close(slave_fd);
         }
     }
-    for (key, value) in env {
-        std::env::set_var(key, value);
+    if let Some(dir) = &plan.cwd {
+        unsafe {
+            libc::chdir(dir.as_ptr());
+        }
     }
-    if argv.is_empty() {
-        unsafe { libc::_exit(125) };
-    }
-    let c_argv: Vec<std::ffi::CString> = argv
-        .iter()
-        .filter_map(|part| std::ffi::CString::new(part.as_str()).ok())
-        .collect();
-    if c_argv.len() != argv.len() || c_argv.is_empty() {
-        unsafe { libc::_exit(125) };
-    }
-    let refs: Vec<&std::ffi::CStr> = c_argv.iter().map(std::ffi::CString::as_c_str).collect();
-    let _ = execvp(&c_argv[0], &refs);
-    let message = format!(
-        "\r\n[rncli] no se encontró el comando '{}'\r\n",
-        argv[0]
-    );
     unsafe {
-        libc::write(
-            libc::STDERR_FILENO,
-            message.as_ptr().cast(),
-            message.len(),
+        libc::execvpe(
+            plan.argv_ptrs[0],
+            plan.argv_ptrs.as_ptr(),
+            plan.env_ptrs.as_ptr(),
         );
-        libc::_exit(127)
-    };
+        let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        let (code, message) = match errno {
+            libc::ENOENT => (127, &plan.not_found),
+            libc::EACCES => (126, &plan.permission),
+            _ => (126, &plan.failed),
+        };
+        let bytes = message.as_bytes();
+        libc::write(libc::STDERR_FILENO, bytes.as_ptr().cast(), bytes.len());
+        libc::_exit(code);
+    }
 }
 
 #[pymethods]
@@ -116,6 +171,10 @@ impl NativePty {
         }
         let cols = cols.max(2);
         let rows = rows.max(2);
+
+        // Reservar todo antes del fork: el hijo no debe asignar memoria.
+        let plan = ChildPlan::build(&argv, &cwd, &env).map_err(os_err)?;
+
         let winsize = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -140,7 +199,7 @@ impl NativePty {
             Ok(ForkResult::Child) => {
                 drop(pair.master);
                 let slave = pair.slave.into_raw_fd();
-                child_exec(slave, &argv, &cwd, &env);
+                child_exec(slave, &plan);
             }
             Err(err) => Err(os_err(format!("fork: {err}"))),
         }

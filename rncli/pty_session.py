@@ -76,9 +76,10 @@ class PtySession(QObject):
                 self._native = spawn_native_pty(
                     self.argv, self.cwd, merged, self.cols, self.rows
                 )
-            except OSError as exc:
-                self._fail(str(exc))
-                return
+            except Exception:
+                # Si el motor nativo falla al crear el PTY, seguimos con el
+                # camino de Python (pty + _spawn.py) en vez de abortar.
+                self._native = None
             if self._native is not None:
                 self.pid = int(self._native.pid())
                 self._master = int(self._native.fileno())
