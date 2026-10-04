@@ -431,6 +431,7 @@ class MainWindow(QMainWindow):
         more = self._chrome_button("···", "Más acciones")
         more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         more_menu = QMenu(more)
+        more_menu.addAction(self.act_new_ssh)
         more_menu.addAction(self.act_merge_tabs)
         more_menu.addAction(self.act_restart)
         more_menu.addSeparator()
@@ -694,6 +695,9 @@ class MainWindow(QMainWindow):
         )
         dialog = AgentChooserDialog(self.config.agents, self.settings, self, cwd_hint=hint)
         if dialog.exec() != AgentChooserDialog.DialogCode.Accepted:
+            return
+        if dialog.wants_ssh():
+            self.choose_ssh()
             return
         agent = dialog.chosen_agent()
         cwd = dialog.chosen_cwd()

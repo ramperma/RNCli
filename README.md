@@ -52,8 +52,9 @@ tooltip explica cómo poner su ruta a mano en `config.json`.
 
 ### Conexiones SSH a equipos remotos
 
-`Ctrl+Shift+S` (o el botón **SSH** de la barra, o `Sesión → Nueva conexión SSH…`)
-abre un diálogo para conectarte a otra máquina. Rellena **usuario**, **host**, **puerto**,
+`Ctrl+Shift+S` (o el botón **SSH** de la barra, o `Sesión → Nueva conexión SSH…`, o la
+opción **Conexión SSH** dentro del selector de `Ctrl+T` / `Ctrl+Shift+T`, o `···` → Más
+acciones) abre un diálogo para conectarte a otra máquina. Rellena **usuario**, **host**, **puerto**,
 **clave privada** y las **opciones de ssh** que necesites (`-L 8080:localhost:80`,
 `-X`, `StrictHostKeyChecking=accept-new`…), o escribe el destino directamente
 (`usuario@servidor:2222`) en el campo **Host**.

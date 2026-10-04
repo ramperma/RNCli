@@ -401,6 +401,8 @@ def main() -> int:
 
     chooser = AgentChooserDialog(config.agents, config.settings, window)
     check(chooser.chosen_agent() is not None, "el selector de agentes lista los agentes")
+    chooser._choose_ssh()
+    check(chooser.wants_ssh(), "el selector de agentes ofrece la conexión SSH")
     chooser.deleteLater()
     sudo = SudoDialog(window)
     snippets_ok = True

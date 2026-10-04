@@ -53,6 +53,7 @@ class AgentChooserDialog(QDialog):
         self.setMinimumWidth(600)
         self._agents = agents
         self._selected: Agent | None = None
+        self._ssh = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 16)
@@ -87,6 +88,18 @@ class AgentChooserDialog(QDialog):
                 button.setProperty("missing", True)
             grid.addWidget(button, index // 3, index % 3)
         root.addLayout(grid)
+
+        self.ssh_button = QToolButton()
+        self.ssh_button.setObjectName("AgentButton")
+        self.ssh_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.ssh_button.setText("⇄  Conexión SSH\nA un equipo remoto")
+        self.ssh_button.setToolTip(
+            "Abre una terminal remota por SSH: usuario, host, puerto, clave y opciones."
+        )
+        self.ssh_button.setMinimumHeight(52)
+        self.ssh_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.ssh_button.clicked.connect(self._choose_ssh)
+        root.addWidget(self.ssh_button)
 
         form = QFormLayout()
         self.cwd_edit = QLineEdit(cwd_hint or settings.start_dir or os.path.expanduser("~"))
@@ -140,6 +153,10 @@ class AgentChooserDialog(QDialog):
         self._selected = agent
         self.accept()
 
+    def _choose_ssh(self) -> None:
+        self._ssh = True
+        self.accept()
+
     def _accept_custom(self) -> None:
         text = self.custom_edit.text().strip()
         if text:
@@ -175,6 +192,9 @@ class AgentChooserDialog(QDialog):
 
     def wants_new_tab(self) -> bool:
         return self.new_tab_check.isChecked()
+
+    def wants_ssh(self) -> bool:
+        return self._ssh
 
 
 # --------------------------------------------------------------------------- SSH
