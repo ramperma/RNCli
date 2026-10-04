@@ -3,8 +3,9 @@
 Multiplexor de **terminales para agentes de IA** hecho con **PySide6**.
 
 Lanza `opencode`, `pi` (Pi Coding Agent), `cursor-agent`, `claude` y `gemini` a la vez,
-cada uno en una **terminal real** (pty + emulación VT100 con [pyte]), y organízalos en
-pestañas y diseños: **uno solo, dos visibles, rejilla 2×2, 3×2 o todos a la vez**.
+cada uno en una **terminal real** (pty + emulador VT nativo en Rust o [pyte]), y
+organízalos en pestañas y diseños: **uno solo, dos visibles, rejilla 2×2, 3×2 o todos a
+la vez**. También puedes abrir **sesiones SSH** a equipos remotos en sus propias pestañas.
 
 ```
 ┌───────────────────────────┬───────────────────────────┐
@@ -25,9 +26,10 @@ pestañas y diseños: **uno solo, dos visibles, rejilla 2×2, 3×2 o todos a la 
 Opciones útiles:
 
 ```bash
-./run.sh --agent pi            # arranca con un agente concreto
-./run.sh --cwd ~/proyecto      # carpeta de trabajo inicial
-./run.sh --no-restore          # ignora la sesión guardada
+./run.sh --agent pi                  # arranca con un agente concreto
+./run.sh --cwd ~/proyecto            # carpeta de trabajo inicial
+./run.sh --ssh usuario@servidor:22   # conecta por SSH al arrancar
+./run.sh --no-restore                # ignora la sesión guardada
 ./run.sh --version
 ```
 
@@ -47,6 +49,25 @@ un **comando propio** (por ejemplo `opencode --model sonnet`).
 El selector muestra la **ruta absoluta** que ha encontrado de cada agente
 (`/home/usuario/.opencode/bin/opencode · instalado`). Si un agente no aparece, el
 tooltip explica cómo poner su ruta a mano en `config.json`.
+
+### Conexiones SSH a equipos remotos
+
+`Ctrl+Shift+S` (o el botón **SSH** de la barra, o `Sesión → Nueva conexión SSH…`)
+abre un diálogo para conectarte a otra máquina. Rellena **usuario**, **host**, **puerto**,
+**clave privada** y las **opciones de ssh** que necesites (`-L 8080:localhost:80`,
+`-X`, `StrictHostKeyChecking=accept-new`…), o escribe el destino directamente
+(`usuario@servidor:2222`) en el campo **Host**.
+
+La conexión se abre en **una pestaña nueva con una terminal real**, así que dentro puedes
+lanzar agentes, editar con vim, usar `htop`… como si estuvieras en la máquina remota
+(ssh pide la contraseña de forma interactiva en ese mismo panel).
+
+* Marca **«Guardar este equipo»** para reutilizarlo: se guarda en `config.json` y aparece
+  en **Equipos guardados**. Puedes eliminarlo con **Eliminar guardado**.
+* **Mantener viva la conexión** añade `ServerAliveInterval=30` para detectar caídas de red.
+* Los paneles SSH también se benefician de la **difusión**, los **diseños** y `Ctrl+Shift+R`
+  para reconectar.
+* Desde la línea de órdenes: `rncli --ssh usuario@servidor:2222` conecta al arrancar.
 
 ### Diseños («que se vean todos» o «solo dos»)
 | Atajo | Diseño | Paneles visibles |
@@ -103,6 +124,7 @@ volver a abrir desde `Ver` / el botón **Explorador**.
 ### Otros atajos
 | Atajo | Acción |
 |-------|--------|
+| `Ctrl+Shift+S` | Nueva conexión SSH a un equipo remoto |
 | `Ctrl+W` / `Ctrl+Shift+W` | Cerrar panel / pestaña |
 | `F2` | Renombrar pestaña |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Pestaña siguiente / anterior |
@@ -144,7 +166,18 @@ que copia la ruta al portapapeles). Formato:
       "env": { "GEMINI_API_KEY": "tu_clave_aquí" }
     }
   ],
-  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1", "escape_key": "terminal" }
+  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1", "escape_key": "terminal" },
+  "ssh_hosts": [
+    {
+      "name": "Producción",
+      "user": "deploy",
+      "host": "prod.example.com",
+      "port": 2222,
+      "identity": "~/.ssh/id_ed25519",
+      "options": ["-L", "8080:localhost:80"],
+      "keepalive": true
+    }
+  ]
 }
 ```
 
@@ -197,9 +230,13 @@ Las dos estrategias recomendadas por el manual para trabajar con agentes son la 
   una terminal normal.
 * Los agentes se lanzan con el PATH del usuario y con `PR_SET_PDEATHSIG`: si RNCli se
   cierra (incluso con `kill -9`), ningún agente se queda huérfano.
-* El emulador usa **pyte** y se dibuja con `QPainter` (rejilla de celdas, 16 colores,
-  256 colores y *truecolor*, negrita, cursiva, subrayado, tachado, reverse, cursor
-  parpadeante, historial de miles de líneas).
+* El emulador se dibuja con `QPainter` (rejilla de celdas, 16 colores, 256 colores y
+  *truecolor*, negrita, cursiva, subrayado, tachado, reverse, cursor parpadeante,
+  historial de miles de líneas). El backend por defecto es un módulo nativo en **Rust**
+  (`native/`, con `alacritty_terminal`); si no está compilado, RNCli usa **pyte**
+  automáticamente. El motor activo se anota en `~/.config/rncli/rncli.log`.
+* Las sesiones **SSH** son paneles normales que ejecutan `ssh` dentro de un pty, así que
+  heredan diseños, difusión, historial y reconexión sin código especial.
 * pyte no entiende las secuencias CSI con prefijo privado que usan las TUI modernas
   (`ESC [ > 4 ; 1 m` para modifyOtherKeys, o los informes de ratón `ESC [ < …`), y las
   interpretaba como SGR (subrayado/negrita en toda la pantalla). RNCli las filtra antes
@@ -241,14 +278,17 @@ rncli/
 ├── window.py        # ventana principal: pestañas, menús, atajos, estados
 ├── layouts.py       # diseños 1 / 2v / 2h / 4 / 6 / todos y difusión
 ├── pane.py          # panel = cabecera + terminal
-├── terminal.py      # emulador VT100 (pyte) + pintado + entrada + historial
-├── pty_session.py   # pty no bloqueante con QSocketNotifier
+├── terminal.py      # pintado + entrada + historial + selección
+├── vt_engine.py     # elige motor VT nativo (Rust) o pyte, misma API
+├── pty_session.py   # pty no bloqueante (nativo o helper python)
 ├── _spawn.py        # setsid + TIOCSCTTY + execvp (helper de arranque)
+├── native/          # crate PyO3: PTY + emulador VT (alacritty_terminal)
 ├── agents.py        # perfiles de agentes (opencode, pi, cursor, claude, gemini, shell)
+├── ssh_hosts.py     # destinos SSH y construcción del comando ssh
 ├── shell_env.py     # PATH real del usuario y búsqueda de ejecutables
-├── config.py        # config.json y session.json
-├── dialogs.py       # selector de agentes, ajustes, atajos y asistente de sudo
-├── theme.py         # temas Oscuro / Dracula / Claro
+├── config.py        # config.json (agentes, ajustes, equipos SSH) y session.json
+├── dialogs.py       # selector de agentes, SSH, ajustes, atajos y asistente de sudo
+├── theme.py         # temas Oscuro / Dracula / Claro / Grafito
 run.sh               # arranque con venv automático
 install.sh           # entrada en el menú de aplicaciones
 tests/smoke_test.py  # comprobaciones sin pantalla
@@ -265,8 +305,9 @@ tests/smoke_test.py  # comprobaciones sin pantalla
 * `smoke_test.py` comprueba que los paneles arrancan, que la terminal interpreta color y
   salida real, los diseños, la difusión (una orden ejecutada de verdad en otro panel), el
   historial, el portapapeles, el guardado y la restauración de la sesión, los ajustes en
-  caliente, los fragmentos de sudo, que Tab llega al terminal seleccionado y que se pueden
-  soltar archivos (imagen, PDF, texto) en un terminal.
+  caliente, los fragmentos de sudo, las conexiones SSH (destino, comando y guardado), que
+  Tab llega al terminal seleccionado y que se pueden soltar archivos (imagen, PDF, texto)
+  en un terminal.
 * `desktop_env_test.py` lanza RNCli con un PATH mínimo (como hace el escritorio) y
   verifica que encuentra `opencode`, `pi`, `git`… y que la TUI de opencode arranca.
 * `cierre_test.sh` arranca la aplicación, toma su PID real de la ventana X11 y comprueba

@@ -338,6 +338,64 @@ def main() -> int:
     check(resolve_executable("no-existe-rncli-xyz") is None, "no inventa ejecutables")
     check(len(login_path().split(os.pathsep)) >= 3, "usa el PATH completo del usuario")
 
+    # --- conexiones SSH ----------------------------------------------------------
+    from rncli.ssh_hosts import SshHost
+
+    parsed = SshHost.parse("deploy@prod.example.com:2222")
+    check(
+        parsed is not None
+        and parsed.user == "deploy"
+        and parsed.host == "prod.example.com"
+        and parsed.port == 2222,
+        "se interpreta el destino SSH [usuario@]host[:puerto]",
+    )
+    ipv6 = SshHost.parse("[::1]:2200")
+    check(
+        ipv6 is not None and ipv6.host == "::1" and ipv6.port == 2200,
+        "se interpretan destinos SSH IPv6 con puerto",
+    )
+    ssh_cmd = SshHost(
+        host="10.0.0.5",
+        user="root",
+        port=2222,
+        identity="~/.ssh/id_ed25519",
+        options=["-L 8080:localhost:80"],
+    ).command()
+    check(
+        ssh_cmd[0] == "ssh"
+        and "2222" in ssh_cmd
+        and "-i" in ssh_cmd
+        and "-L" in ssh_cmd
+        and ssh_cmd[-1] == "root@10.0.0.5",
+        "el comando ssh incluye puerto, identidad y opciones",
+    )
+    check(
+        SshHost.from_dict(SshHost(host="h", user="u").to_dict()).id == "u@h:22",
+        "los equipos SSH se serializan y se recuperan",
+    )
+
+    ssh_config = Config.load()
+    ssh_config.ssh_hosts = [SshHost(host="equipo-u", user="u", name="Equipo U")]
+    ssh_config.save()
+    check(
+        any(host.host == "equipo-u" for host in Config.load().ssh_hosts),
+        "config.json guarda los equipos SSH",
+    )
+
+    from rncli.dialogs import SshDialog
+
+    ssh_dialog = SshDialog(ssh_config.ssh_hosts, window)
+    ssh_dialog._apply_preset("alice@server:2222")
+    ssh_dialog._connect()
+    mini_host = ssh_dialog.result_host()
+    check(
+        mini_host is not None and mini_host.user == "alice" and mini_host.port == 2222,
+        "el diálogo SSH construye el destino a partir del formulario",
+    )
+    ssh_dialog.save_check.setChecked(True)
+    check(ssh_dialog.wants_save(), "el diálogo SSH permite guardar el equipo")
+    ssh_dialog.deleteLater()
+
     # --- diálogos ----------------------------------------------------------------
     from rncli.dialogs import AgentChooserDialog, SettingsDialog, ShortcutsDialog, SudoDialog
 

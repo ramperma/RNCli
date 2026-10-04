@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .agents import Agent, default_agents
+from .ssh_hosts import SshHost
 
 CONFIG_DIR = Path(os.environ.get("RNCLI_CONFIG_DIR") or (Path.home() / ".config" / "rncli"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
@@ -73,6 +74,7 @@ class Settings:
 class Config:
     agents: list[Agent] = field(default_factory=default_agents)
     settings: Settings = field(default_factory=Settings)
+    ssh_hosts: list[SshHost] = field(default_factory=list)
 
     # ------------------------------------------------------------------ load/-
     @classmethod
@@ -89,13 +91,21 @@ class Config:
         agents = [Agent.from_dict(item) for item in data.get("agents", []) if isinstance(item, dict)]
         if not agents:
             agents = default_agents()
-        return cls(agents=agents, settings=Settings.from_dict(data.get("settings", {})))
+        ssh_hosts = [
+            SshHost.from_dict(item) for item in data.get("ssh_hosts", []) if isinstance(item, dict)
+        ]
+        return cls(
+            agents=agents,
+            settings=Settings.from_dict(data.get("settings", {})),
+            ssh_hosts=ssh_hosts,
+        )
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "agents": [agent.to_dict() for agent in self.agents],
             "settings": self.settings.to_dict(),
+            "ssh_hosts": [host.to_dict() for host in self.ssh_hosts],
         }
         tmp = CONFIG_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -450,7 +450,18 @@ class WorkspaceWidget(QWidget):
             "title": self.title,
             "layout": self.layout_mode,
             "broadcast": self.broadcast,
-            "panes": [{"agent": pane.agent.id, "cwd": pane.cwd} for pane in self._panes],
+            "panes": [
+                {
+                    "agent": pane.agent.id,
+                    "cwd": pane.cwd,
+                    "name": pane.agent.name,
+                    "command": list(pane.agent.command),
+                    "emoji": pane.agent.emoji,
+                    "color": pane.agent.color,
+                    "description": pane.agent.description,
+                }
+                for pane in self._panes
+            ],
         }
 
     def shutdown(self) -> None:

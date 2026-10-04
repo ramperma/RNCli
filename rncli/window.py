@@ -31,10 +31,12 @@ from .dialogs import (
     AgentChooserDialog,
     SettingsDialog,
     ShortcutsDialog,
+    SshDialog,
     SudoDialog,
 )
 from .file_browser import FileBrowserWidget
 from .layouts import LAYOUT_LABELS, LAYOUT_SHORT, WorkspaceWidget
+from .ssh_hosts import SshHost
 from .terminal import TerminalWidget, is_host_key, tab_sequence
 from .theme import app_stylesheet
 
@@ -149,6 +151,8 @@ class MainWindow(QMainWindow):
             return self.act_close_pane
         if ctrl and shift and key == Qt.Key.Key_B:
             return self.act_broadcast
+        if ctrl and shift and key == Qt.Key.Key_S:
+            return self.act_new_ssh
         if ctrl and shift and key == Qt.Key.Key_R:
             return self.act_restart
         if ctrl and shift and key == Qt.Key.Key_M:
@@ -231,6 +235,9 @@ class MainWindow(QMainWindow):
         self.act_broadcast = self._act(
             "Difusión (escribir en todos)", "Ctrl+Shift+B", self.toggle_broadcast, checkable=True
         )
+        self.act_new_ssh = self._act(
+            "Nueva conexión SSH…", "Ctrl+Shift+S", lambda: self.choose_ssh()
+        )
         self.act_settings = self._act("Ajustes…", None, self.open_settings)
         self.act_open_config = self._act("Abrir config.json", None, self.open_config)
         self.act_sudo = self._act("Sudo para agentes…", None, self.open_sudo)
@@ -284,6 +291,7 @@ class MainWindow(QMainWindow):
         session_menu = bar.addMenu("&Sesión")
         session_menu.addAction(self.act_new_tab)
         session_menu.addAction(self.act_new_pane)
+        session_menu.addAction(self.act_new_ssh)
         session_menu.addSeparator()
         session_menu.addAction(self.act_close_pane)
         session_menu.addAction(self.act_close_tab)
@@ -359,8 +367,14 @@ class MainWindow(QMainWindow):
             "Nueva pestaña (Ctrl+T)",
             lambda: self.choose_agent(new_tab=True),
         )
+        new_ssh = self._chrome_button(
+            "SSH",
+            "Conectar por SSH a un equipo remoto (Ctrl+Shift+S)",
+            lambda: self.choose_ssh(),
+        )
         toolbar.addWidget(new_pane)
         toolbar.addWidget(new_tab)
+        toolbar.addWidget(new_ssh)
         toolbar.addSeparator()
 
         caption = QLabel("DISEÑO")
@@ -597,6 +611,8 @@ class MainWindow(QMainWindow):
             for pane in panes:
                 agent = self.config.agent(str(pane.get("agent", "")))
                 if agent is None:
+                    agent = self._agent_from_state(pane)
+                if agent is None:
                     continue
                 workspace.add_pane(agent, str(pane.get("cwd") or self.settings.start_dir), focus=False)
             if workspace.count():
@@ -607,6 +623,25 @@ class MainWindow(QMainWindow):
                 self._remove_workspace(workspace)
         if not created:
             self.new_tab()
+
+    @staticmethod
+    def _agent_from_state(pane: dict) -> Agent | None:
+        """Reconstruye un agente (SSH o comando propio) guardado en la sesión.
+
+        Los agentes de ``config.json`` se buscan por id; los SSH y los comandos
+        propios no están allí, así que se rehacen a partir del comando guardado.
+        """
+        command = pane.get("command")
+        if not isinstance(command, list) or not command:
+            return None
+        return Agent(
+            id=str(pane.get("agent") or command[0]),
+            name=str(pane.get("name") or command[0]),
+            command=[str(part) for part in command],
+            emoji=str(pane.get("emoji") or ">"),
+            color=str(pane.get("color") or "#58a6ff"),
+            description=str(pane.get("description") or ""),
+        )
 
     def _workspaces(self):
         return [self.tabs.widget(i) for i in range(self.tabs.count())]
@@ -667,6 +702,35 @@ class MainWindow(QMainWindow):
             workspace = self.new_tab(agent, cwd)
         else:
             workspace.add_pane(agent, cwd)
+        self._update_status()
+
+    # ------------------------------------------------------------------ SSH
+    def choose_ssh(self, preset: str = "") -> None:
+        """Diálogo para conectar por SSH a un equipo remoto y abrir su terminal."""
+        dialog = SshDialog(self.config.ssh_hosts, self, preset=preset)
+        if dialog.exec() != SshDialog.DialogCode.Accepted:
+            return
+        host = dialog.result_host()
+        if host is None:
+            return
+        removed = {item.id for item in dialog.removed_hosts()}
+        saved = [item for item in self.config.ssh_hosts if item.id not in removed]
+        if dialog.wants_save():
+            saved = [item for item in saved if item.id != host.id]
+            saved.append(host)
+        self.config.ssh_hosts = saved
+        self.config.save()
+        self.open_ssh(host)
+
+    def open_ssh(self, host: SshHost) -> None:
+        """Abre una sesión SSH en una pestaña nueva (una terminal real por conexión)."""
+        if host is None or not host.host:
+            return
+        agent = host.to_agent()
+        self.new_tab(agent, self.settings.start_dir)
+        self.statusBar().showMessage(
+            f"Conectando por SSH a {host.target}:{int(host.port)}…", 6000
+        )
         self._update_status()
 
     def close_pane(self) -> None:
@@ -1031,8 +1095,9 @@ class MainWindow(QMainWindow):
             "<p>Lanza opencode, pi, cursor-agent, claude o gemini en paralelo, "
             "organízalos en pestañas y diseños (1, 2, 4, 6 o todos visibles) y "
             "muéstrales la misma orden con la difusión activada.</p>"
-            "<p>Cada panel es una terminal real (pty + VT100 con pyte), así que las "
-            "TUI funcionan tal cual.</p>"
+            "<p>Cada panel es una terminal real (pty + emulador VT nativo en Rust o "
+            "pyte), así que las TUI funcionan tal cual. También puedes abrir sesiones "
+            "SSH a equipos remotos con Ctrl+Shift+S.</p>"
             "<p style='color:gray'>Iconos: el tema del escritorio · Atajos: F1</p>",
         )
 

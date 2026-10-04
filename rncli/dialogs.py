@@ -37,6 +37,7 @@ from . import APP_NAME, __version__
 from .agents import Agent
 from .config import ESCAPE_KEY_LABELS, ESCAPE_KEY_MODES, LAYOUTS, Settings
 from .layouts import LAYOUT_LABELS
+from .ssh_hosts import SshHost
 from .theme import THEME_LABELS
 
 MD_GUIDE = Path(__file__).resolve().parents[1] / "sudo-config-strategies.md"
@@ -176,6 +177,202 @@ class AgentChooserDialog(QDialog):
         return self.new_tab_check.isChecked()
 
 
+# --------------------------------------------------------------------------- SSH
+class SshDialog(QDialog):
+    """Configura (y opcionalmente guarda) una conexión SSH a un equipo remoto."""
+
+    def __init__(self, hosts: list[SshHost], parent=None, preset: str = "") -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} · conexión SSH")
+        self.setMinimumWidth(560)
+        self._hosts = list(hosts)
+        self._removed: list[SshHost] = []
+        self._result: SshHost | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(12)
+        title = QLabel("Conectar por SSH a un equipo remoto")
+        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        root.addWidget(title)
+        hint = QLabel(
+            "La sesión se abre en un panel (terminal real): podrás ejecutar comandos, "
+            "agentes o transferir archivos en la máquina remota."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+
+        self.saved: QComboBox | None = None
+        if self._hosts:
+            self.saved = QComboBox()
+            self.saved.currentIndexChanged.connect(self._load_saved)
+            form.addRow("Equipos guardados", self.saved)
+            self._reload_saved()
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("p. ej. «Servidor de producción» (opcional)")
+
+        self.user_edit = QLineEdit()
+        self.user_edit.setPlaceholderText("usuario (opcional)")
+
+        self.host_edit = QLineEdit()
+        self.host_edit.setPlaceholderText("host o IP, p. ej. 192.168.1.20")
+
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(22)
+
+        self.identity_edit = QLineEdit()
+        self.identity_edit.setPlaceholderText("~/.ssh/id_ed25519 (opcional)")
+        identity_browse = QPushButton("…")
+        identity_browse.setFixedWidth(32)
+        identity_browse.setToolTip("Elegir la clave privada")
+        identity_browse.clicked.connect(self._browse_identity)
+        identity_row = QHBoxLayout()
+        identity_row.addWidget(self.identity_edit, 1)
+        identity_row.addWidget(identity_browse)
+        identity_box = QWidget()
+        identity_box.setLayout(identity_row)
+
+        self.options_edit = QLineEdit()
+        self.options_edit.setPlaceholderText("p. ej. -L 8080:localhost:80   (opcional)")
+
+        self.keepalive_check = QCheckBox("Mantener viva la conexión (ServerAliveInterval)")
+        self.keepalive_check.setChecked(True)
+        self.keepalive_check.setToolTip("Envía un latido cada 30 s para detectar caídas de red.")
+
+        form.addRow("Nombre", self.name_edit)
+        form.addRow("Usuario", self.user_edit)
+        form.addRow("Host", self.host_edit)
+        form.addRow("Puerto", self.port_spin)
+        form.addRow("Clave privada", identity_box)
+        form.addRow("Opciones de ssh", self.options_edit)
+        form.addRow("", self.keepalive_check)
+        root.addLayout(form)
+
+        self.save_check = QCheckBox("Guardar este equipo para reutilizarlo")
+        self.save_check.setChecked(not self._hosts)
+        root.addWidget(self.save_check)
+
+        if preset:
+            self._apply_preset(preset)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Conectar")
+        buttons.accepted.connect(self._connect)
+        buttons.rejected.connect(self.reject)
+
+        row = QHBoxLayout()
+        self.delete_button = QPushButton("Eliminar guardado")
+        self.delete_button.setToolTip("Quita el equipo seleccionado de la lista")
+        self.delete_button.clicked.connect(self._delete_saved)
+        self.delete_button.setEnabled(bool(self._hosts))
+        row.addWidget(self.delete_button)
+        row.addStretch(1)
+        row.addWidget(buttons)
+        root.addLayout(row)
+
+        self.host_edit.returnPressed.connect(self._connect)
+        self.user_edit.returnPressed.connect(self._connect)
+        self.port_spin.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.host_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    # ------------------------------------------------------------------ equipos guardados
+    def _reload_saved(self) -> None:
+        if self.saved is None:
+            return
+        self.saved.blockSignals(True)
+        self.saved.clear()
+        self.saved.addItem("— Nuevo equipo —", -1)
+        for index, host in enumerate(self._hosts):
+            self.saved.addItem(f"{host.label}  ({host.target}:{int(host.port)})", index)
+        self.saved.setCurrentIndex(0)
+        self.saved.blockSignals(False)
+        delete_button = getattr(self, "delete_button", None)
+        if delete_button is not None:
+            delete_button.setEnabled(bool(self._hosts))
+
+    def _load_saved(self, index: int) -> None:
+        if self.saved is None:
+            return
+        data = self.saved.itemData(index)
+        if data is None or int(data) < 0 or int(data) >= len(self._hosts):
+            return
+        self._fill(self._hosts[int(data)])
+
+    def _fill(self, host: SshHost) -> None:
+        self.name_edit.setText(host.name)
+        self.user_edit.setText(host.user)
+        self.host_edit.setText(host.host)
+        self.port_spin.setValue(int(host.port))
+        self.identity_edit.setText(host.identity)
+        self.options_edit.setText(" ".join(host.options))
+        self.keepalive_check.setChecked(host.keepalive)
+
+    def _apply_preset(self, preset: str) -> None:
+        host = SshHost.parse(preset)
+        if host is not None:
+            self._fill(host)
+
+    def _delete_saved(self) -> None:
+        if self.saved is None:
+            return
+        data = self.saved.currentData()
+        if data is None or int(data) < 0 or int(data) >= len(self._hosts):
+            return
+        host = self._hosts.pop(int(data))
+        self._removed.append(host)
+        # Se conserva lo que haya en el formulario para poder reconectar igualmente.
+        self._reload_saved()
+
+    # ------------------------------------------------------------------ formulario
+    def _browse_identity(self) -> None:
+        start = os.path.expanduser(self.identity_edit.text().strip() or "~/.ssh")
+        chosen, _ = QFileDialog.getOpenFileName(self, "Clave privada", start)
+        if chosen:
+            self.identity_edit.setText(chosen)
+
+    def _build_host(self) -> SshHost | None:
+        host = self.host_edit.text().strip()
+        if not host:
+            return None
+        options = shlex.split(self.options_edit.text().strip()) if self.options_edit.text().strip() else []
+        return SshHost(
+            host=host,
+            user=self.user_edit.text().strip(),
+            port=int(self.port_spin.value()),
+            identity=self.identity_edit.text().strip(),
+            options=options,
+            name=self.name_edit.text().strip(),
+            keepalive=self.keepalive_check.isChecked(),
+        )
+
+    def _connect(self) -> None:
+        host = self._build_host()
+        if host is None:
+            self.host_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            return
+        self._result = host
+        self.accept()
+
+    # ------------------------------------------------------------------ salida
+    def result_host(self) -> SshHost | None:
+        return self._result
+
+    def wants_save(self) -> bool:
+        return self.save_check.isChecked() and self._result is not None
+
+    def removed_hosts(self) -> list[SshHost]:
+        return list(self._removed)
+
+
 # --------------------------------------------------------------------------- ajustes
 class SettingsDialog(QDialog):
     def __init__(self, settings: Settings, agents: list[Agent], parent=None) -> None:
@@ -312,6 +509,7 @@ class ShortcutsDialog(QDialog):
         ("Pestañas y paneles", None),
         ("Ctrl+T", "Nueva pestaña (elige agente)"),
         ("Ctrl+Shift+T", "Nuevo panel en la pestaña actual"),
+        ("Ctrl+Shift+S", "Nueva conexión SSH a un equipo remoto (se guarda en config.json)"),
         ("Ctrl+W", "Cerrar el panel activo"),
         ("Ctrl+Shift+W", "Cerrar la pestaña"),
         ("F2", "Renombrar la pestaña"),

@@ -76,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--cwd", default=None, help="carpeta de trabajo inicial")
     parser.add_argument(
+        "--ssh",
+        default=None,
+        help="conecta por SSH al arrancar ([usuario@]host[:puerto])",
+    )
+    parser.add_argument(
         "--no-restore",
         action="store_true",
         help="ignora la sesión guardada en este arranque",
@@ -124,6 +129,12 @@ def main(argv: list[str] | None = None) -> int:
         agent = config.agent(args.agent)
         if agent is not None:
             window.new_tab(agent, args.cwd or config.settings.start_dir)
+    if args.ssh:
+        from .ssh_hosts import SshHost
+
+        host = SshHost.parse(args.ssh)
+        if host is not None:
+            window.open_ssh(host)
     _install_signal_handlers(app, window.shutdown)
     app.aboutToQuit.connect(window.shutdown)
 
