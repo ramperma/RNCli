@@ -331,6 +331,16 @@ impl NativeVte {
         self.term.mode().contains(TermMode::BRACKETED_PASTE)
     }
 
+    /// La aplicación pidió eventos de ratón (DECSET 1000/1002/1003).
+    fn mouse_tracking(&self) -> bool {
+        self.term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// La aplicación prefiere la codificación SGR (DECSET 1006) para el ratón.
+    fn mouse_sgr(&self) -> bool {
+        self.term.mode().contains(TermMode::SGR_MOUSE)
+    }
+
     fn title(&self) -> String {
         self.bus.0.borrow().title.clone()
     }

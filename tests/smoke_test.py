@@ -193,6 +193,32 @@ def main() -> int:
     terminal.scroll_to_bottom()
     check(terminal._scroll_offset == 0, "volver abajo restaura la vista en vivo")
 
+    # --- rueda reenviada a la app (OpenCode/OpenTUI piden el ratón) ---------------
+    terminal.feed_text("\x1b[?1000h\x1b[?1006h")
+    wait(200)
+    check(terminal._engine.mouse_tracking(), "el motor detecta que la app pidió eventos de ratón")
+    check(terminal._engine.mouse_sgr(), "el motor detecta la codificación SGR del ratón (1006)")
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtGui import QWheelEvent
+
+    def make_wheel(delta_y: int, mods=Qt.KeyboardModifier.NoModifier) -> QWheelEvent:
+        return QWheelEvent(
+            QPointF(50, 50), QPointF(50, 50), QPoint(0, 0), QPoint(0, delta_y),
+            Qt.MouseButton.NoButton, mods, Qt.ScrollPhase.NoScrollPhase, False,
+        )
+
+    sent: list[bytes] = []
+    original_write = terminal.session.write
+    terminal.session.write = lambda data: (sent.append(bytes(data)), original_write(data))[1]
+    QApplication.sendEvent(terminal, make_wheel(120))
+    check(any(b"[<64;" in chunk for chunk in sent), "la rueda se reenvía a la app como secuencia de ratón")
+    check(terminal._scroll_offset == 0, "la rueda reenviada no desplaza el historial local")
+    QApplication.sendEvent(terminal, make_wheel(120, Qt.KeyboardModifier.ShiftModifier))
+    check(terminal._scroll_offset > 0, "Shift+rueda sigue desplazando el historial de RNCli")
+    terminal.session.write = original_write
+    terminal.feed_text("\x1b[?1000l\x1b[?1006l")
+    terminal.scroll_to_bottom()
+
     # --- secuencias que pyte malinterpreta --------------------------------------
     active.send(b'printf "\\033[>4;1m\\033[0mSIN-RAYAS\\n"\n')
     wait(900)

@@ -414,7 +414,8 @@ class TerminalWidget(QWidget):
         grown = self._history_len() - before
         if self._scroll_offset > 0 and grown:
             # mantenemos a la vista el mismo contenido mientras llega salida nueva
-            self._scroll_offset = min(self._history_len(), self._scroll_offset + grown)
+            # (el historial también puede reducirse al entrar en pantalla alternativa)
+            self._scroll_offset = max(0, min(self._history_len(), self._scroll_offset + grown))
 
         self._sync_scrollbar()
 
@@ -835,23 +836,59 @@ class TerminalWidget(QWidget):
         delta = event.angleDelta().y()
         pixel_delta = event.pixelDelta().y()
         lines = 0
+        notches = 0
         if delta != 0:
             # En ratón estándar: 120 unidades por paso -> ~3 líneas por muesca
             steps = delta / 120.0
             lines = int(steps * 3)
             if lines == 0:
                 lines = 1 if delta > 0 else -1
+            notches = (1 if delta > 0 else -1) * max(1, int(round(abs(steps))))
         elif pixel_delta != 0:
             # Touchpad de alta resolución
             lines = int(pixel_delta / max(1.0, self._cell_h))
             if lines == 0:
                 lines = 1 if pixel_delta > 0 else -1
+            notches = 1 if pixel_delta > 0 else -1
 
         if lines == 0:
             return
 
+        # Si la aplicación pidió el ratón (OpenCode/OpenTUI en pantalla
+        # alternativa), la rueda debe llegar a ella para que desplaze su
+        # propio contenido; Shift+rueda sigue desplazando el historial de RNCli.
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        tracking = getattr(self._engine, "mouse_tracking", None)
+        if not shift and callable(tracking) and tracking() and self.session.is_alive():
+            self._send_wheel_to_session(event.position(), notches)
+            event.accept()
+            return
+
         self.scroll_by(lines)
         event.accept()
+
+    def _send_wheel_to_session(self, pos, notches: int) -> None:
+        """Reenvía la rueda a la TUI como secuencias de ratón (rueda arriba=64, abajo=65)."""
+        cell = self._cell_at(pos.x(), pos.y())
+        if cell is None:
+            col, row = int(self._screen.cursor.x), int(self._screen.cursor.y)
+        else:
+            col = cell[1]
+            row = cell[0] - (self._history_len() - self._scroll_offset)
+        col = max(0, min(self._screen.columns - 1, col))
+        row = max(0, min(self._screen.lines - 1, row))
+        code = 64 if notches > 0 else 65
+        steps = min(abs(notches), 5)
+        sgr = getattr(self._engine, "mouse_sgr", None)
+        if callable(sgr) and sgr():
+            seq = b"".join(
+                f"\x1b[<{code};{col + 1};{row + 1}M\x1b[<{code};{col + 1};{row + 1}m".encode()
+                for _ in range(steps)
+            )
+        else:
+            seq = b"".join(b"\x1b[M" + bytes([code + 32, col + 33, row + 33]) for _ in range(steps))
+        self.session.write(seq)
+        self.inputReady.emit(seq)
 
     def scroll_by(self, lines: int) -> None:
         limit = self._history_len()

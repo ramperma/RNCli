@@ -192,6 +192,12 @@ class NativeEngine:
     def bracketed_paste(self) -> bool:
         return bool(self._vte.bracketed_paste())
 
+    def mouse_tracking(self) -> bool:
+        return bool(self._vte.mouse_tracking())
+
+    def mouse_sgr(self) -> bool:
+        return bool(self._vte.mouse_sgr())
+
     def title(self) -> str:
         return str(self._vte.title() or "")
 
@@ -254,6 +260,14 @@ class PyteEngine:
 
     def bracketed_paste(self) -> bool:
         return 2004 in getattr(self.screen, "mode", set())
+
+    def mouse_tracking(self) -> bool:
+        # pyte desplaza los modos privados: DECSET ?1000h se guarda como 1000 << 5
+        modes = set(getattr(self.screen, "mode", set()))
+        return bool(modes & {(m << 5) for m in (1000, 1002, 1003)})
+
+    def mouse_sgr(self) -> bool:
+        return (1006 << 5) in set(getattr(self.screen, "mode", set()))
 
     def title(self) -> str:
         title = getattr(self.screen, "title", "") or ""
