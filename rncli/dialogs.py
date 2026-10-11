@@ -1126,7 +1126,6 @@ class ShortcutsDialog(QDialog):
         ("Shift + rueda", "Historial de la terminal aunque la TUI use el ratón"),
         ("Ctrl+H", "En el explorador: mostrar u ocultar archivos ocultos"),
         ("··· en la barra", "Unir pestañas, reiniciar, sudo y ayuda"),
-        ("Ocultar en la barra / Ver → Barra de herramientas", "Ocultar o mostrar la barra superior"),
     ]
 
     def __init__(self, parent=None, shortcuts: dict | None = None) -> None:

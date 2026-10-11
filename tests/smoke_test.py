@@ -597,13 +597,25 @@ def main() -> int:
     check(
         not window.toolbar.isVisible()
         and not window.settings.show_toolbar
-        and not window.act_toolbar.isChecked(),
+        and not window.act_toggle_toolbar.isChecked(),
         "se puede ocultar la barra de herramientas",
     )
-    window.act_toolbar.trigger()
+    window.act_toggle_toolbar.trigger()
     check(
-        window.toolbar.isVisible() and window.settings.show_toolbar and window.act_toolbar.isChecked(),
+        window.toolbar.isVisible()
+        and window.settings.show_toolbar
+        and window.act_toggle_toolbar.isChecked(),
         "Ver → Barra de herramientas la vuelve a mostrar",
+    )
+    window.act_toggle_files.trigger()
+    check(
+        not window.file_dock.isVisible() and not window.act_toggle_files.isChecked(),
+        "el atajo toggle_files oculta el explorador",
+    )
+    window.act_toggle_files.trigger()
+    check(
+        window.file_dock.isVisible() and window.act_toggle_files.isChecked(),
+        "el atajo toggle_files vuelve a mostrar el explorador",
     )
     from PySide6.QtWidgets import QToolButton
 
@@ -618,7 +630,7 @@ def main() -> int:
         not window.toolbar.isVisible() and not window.settings.show_toolbar,
         "el botón Ocultar esconde la barra de herramientas",
     )
-    window.act_toolbar.trigger()
+    window.act_toggle_toolbar.trigger()
     window._persist_session()
     persisted = load_session()
     check(
@@ -668,6 +680,12 @@ def main() -> int:
         window.act_new_tab.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["new_tab"])
         and window.act_close_pane.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["close_pane"]),
         "los atajos por defecto usan Ctrl+Shift+letra y no pisan a los agentes",
+    )
+    check(
+        window.act_toggle_files.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["toggle_files"])
+        and window.act_toggle_toolbar.shortcut()
+        == QKeySequence(SHORTCUT_DEFAULTS["toggle_toolbar"]),
+        "explorador y barra de herramientas tienen atajo por defecto",
     )
     check(
         window.act_new_tab.shortcutContext() == Qt.ShortcutContext.WindowShortcut,

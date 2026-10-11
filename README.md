@@ -106,8 +106,10 @@ todos (sin necesidad de activar la difusión).
 ### Explorador
 
 El panel **Explorador** aparece a la izquierda y se puede arrastrar a la derecha, cerrar o
-volver a abrir desde `Ver` / el botón **Explorador**. La barra de herramientas se oculta
-con el botón **Ocultar** (o `Ver → Barra de herramientas`) para ganar espacio en portátiles.
+volver a abrir desde `Ver` / el botón **Explorador** o con `Ctrl+Shift+E`. La barra de
+herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas` o
+`Ctrl+Shift+H` para ganar espacio en portátiles. Ambos atajos son configurables en
+`Ajustes → Atajos`.
 
 * Muestra **carpetas y archivos** (imágenes, PDF, texto o cualquier otro).
 * Arrastra un archivo y suéltalo encima de **un terminal concreto** para pegar su ruta
@@ -141,6 +143,8 @@ con el botón **Ocultar** (o `Ver → Barra de herramientas`) para ganar espacio
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
 | Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
 | `Ctrl+Shift+R` | Reiniciar el agente activo (`Enter` en una terminal terminada) |
+| `Ctrl+Shift+E` | Mostrar u ocultar el **Explorador** |
+| `Ctrl+Shift+H` | Mostrar u ocultar la **barra de herramientas** |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Tamaño de letra |
 | `F11` | Pantalla completa |
 | `F1` | Todos los atajos |

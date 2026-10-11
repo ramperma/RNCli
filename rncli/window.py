@@ -228,6 +228,15 @@ class MainWindow(QMainWindow):
         self.act_open_config = self._act("open_config", "Abrir config.json", self.open_config)
         self.act_sudo = self._act("sudo", "Sudo para agentes…", self.open_sudo)
         self.act_help = self._act("help", "Atajos y ayuda", self.open_help)
+        self.act_toggle_files = self._act(
+            "toggle_files", "Mostrar u ocultar el explorador", self._toggle_files_shortcut, checkable=True
+        )
+        self.act_toggle_toolbar = self._act(
+            "toggle_toolbar",
+            "Mostrar u ocultar la barra de herramientas",
+            self._toggle_toolbar_shortcut,
+            checkable=True,
+        )
 
         # Acciones internas que se disparan desde el Host Key aunque el foco
         # esté temporalmente en la barra inferior.
@@ -408,7 +417,7 @@ class MainWindow(QMainWindow):
 
         files = self._chrome_button(
             "Explorador",
-            "Mostrar u ocultar el explorador de archivos",
+            f"Mostrar u ocultar el explorador de archivos ({self._shortcuts.get('toggle_files', '')})",
             self._toggle_file_browser,
             checkable=True,
         )
@@ -432,22 +441,24 @@ class MainWindow(QMainWindow):
 
         hide_bar = self._chrome_button(
             "Ocultar",
-            "Ocultar la barra de herramientas (más espacio). Para mostrarla: Ver → Barra de herramientas",
+            "Ocultar la barra de herramientas (más espacio). Para mostrarla: "
+            f"{self._shortcuts.get('toggle_toolbar', '')} o Ver → Barra de herramientas",
             lambda: self.toolbar.setVisible(False),
         )
         self.toolbar.addWidget(hide_bar)
 
         self.toolbar.setVisible(self.settings.show_toolbar)
-        self.act_toolbar = self.toolbar.toggleViewAction()
-        self.act_toolbar.setText("Barra de herramientas")
-        self.act_toolbar.setToolTip("Mostrar u ocultar la barra de herramientas · útil en pantallas pequeñas")
+        # Atajo configurable (tabla SHORTCUT_DEFAULTS); el estado del check sigue
+        # a la visibilidad real, cambie como cambie (botón Ocultar, menú Ver, atajo).
+        self.act_toggle_toolbar.setChecked(self.toolbar.isVisible())
+        self.toolbar.visibilityChanged.connect(self.act_toggle_toolbar.setChecked)
         self.toolbar.visibilityChanged.connect(self._on_toolbar_visibility)
         more_menu.addSeparator()
-        more_menu.addAction(self.act_toolbar)
+        more_menu.addAction(self.act_toggle_toolbar)
         for menu_action in self.menuBar().actions():
             if menu_action.text().replace("&", "") == "Ver" and menu_action.menu() is not None:
                 menu_action.menu().addSeparator()
-                menu_action.menu().addAction(self.act_toolbar)
+                menu_action.menu().addAction(self.act_toggle_toolbar)
                 break
 
     def _build_tabs(self) -> None:
@@ -504,6 +515,8 @@ class MainWindow(QMainWindow):
         self.file_dock.setMinimumWidth(260)
         self.file_dock.resize(280, self.height())
         self.file_dock.visibilityChanged.connect(self.file_button.setChecked)
+        self.file_dock.visibilityChanged.connect(self.act_toggle_files.setChecked)
+        self.act_toggle_files.setChecked(self.file_dock.isVisible())
         self.file_button.setChecked(self.file_dock.isVisible())
         self.act_show_hidden = QAction("Mostrar archivos ocultos", self)
         self.act_show_hidden.setCheckable(True)
@@ -515,12 +528,20 @@ class MainWindow(QMainWindow):
         for menu_action in self.menuBar().actions():
             if menu_action.text().replace("&", "") == "Ver" and menu_action.menu() is not None:
                 menu_action.menu().addSeparator()
-                menu_action.menu().addAction(self.file_dock.toggleViewAction())
+                menu_action.menu().addAction(self.act_toggle_files)
                 menu_action.menu().addAction(self.act_show_hidden)
                 break
 
     def _toggle_file_browser(self, visible: bool) -> None:
         self.file_dock.setVisible(visible)
+
+    def _toggle_files_shortcut(self) -> None:
+        """Atajo toggle_files: alterna el explorador desde cualquier foco."""
+        self.file_dock.setVisible(not self.file_dock.isVisible())
+
+    def _toggle_toolbar_shortcut(self) -> None:
+        """Atajo toggle_toolbar: alterna la barra de herramientas."""
+        self.toolbar.setVisible(not self.toolbar.isVisible())
 
     def _on_toolbar_visibility(self, visible: bool) -> None:
         visible = bool(visible)

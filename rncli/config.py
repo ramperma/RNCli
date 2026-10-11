@@ -46,6 +46,8 @@ SHORTCUT_DEFAULTS: dict[str, str] = {
     "zoom_reset": "Ctrl+0",
     "fullscreen": "F11",
     "help": "F1",
+    "toggle_files": "Ctrl+Shift+E",
+    "toggle_toolbar": "Ctrl+Shift+H",
     "layout_1": "Alt+1",
     "layout_2v": "Alt+2",
     "layout_2h": "Alt+3",
@@ -87,6 +89,8 @@ SHORTCUT_LABELS: dict[str, str] = {
     "zoom_reset": "Tamaño de letra normal",
     "fullscreen": "Pantalla completa",
     "help": "Atajos y ayuda",
+    "toggle_files": "Mostrar u ocultar el explorador",
+    "toggle_toolbar": "Mostrar u ocultar la barra de herramientas",
     "layout_1": "Diseño: solo el panel activo",
     "layout_2v": "Diseño: dos paneles en paralelo",
     "layout_2h": "Diseño: dos paneles apilados",
@@ -102,7 +106,8 @@ SHORTCUT_SECTIONS: list[tuple[str, list[str]]] = [
     ("Diseño y paneles", ["layout_1", "layout_2v", "layout_2h", "layout_4", "layout_6",
                           "layout_all", "focus_next", "focus_prev", "maximize"]),
     ("Agente", ["restart", "broadcast"]),
-    ("Vista y salida", ["zoom_in", "zoom_out", "zoom_reset", "fullscreen", "help", "quit"]),
+    ("Vista y salida", ["zoom_in", "zoom_out", "zoom_reset", "fullscreen", "toggle_files",
+                        "toggle_toolbar", "help", "quit"]),
 ]
 
 
