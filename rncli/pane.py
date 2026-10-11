@@ -93,7 +93,7 @@ class PaneWidget(QFrame):
         self.close_button = QToolButton(self.header)
         self.close_button.setObjectName("PaneClose")
         self.close_button.setText("✕")
-        self.close_button.setToolTip("Cerrar este panel (Ctrl+W)")
+        self.close_button.setToolTip("Cerrar este panel")
         self.close_button.setAutoRaise(True)
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.close_button.setFixedSize(24, 24)

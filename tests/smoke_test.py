@@ -658,6 +658,89 @@ def main() -> int:
     check(is_host_key(esc_ev, host_settings), "Escape configurado es Host Key")
     check(not is_host_key(esc_ev, term_settings), "Escape por defecto va al terminal")
 
+    # --- Atajos del chasis: tabla única configurable (config.SHORTCUT_DEFAULTS) ---
+    from PySide6.QtGui import QKeySequence
+
+    from rncli.config import SHORTCUT_CLASSIC, SHORTCUT_DEFAULTS, merged_shortcuts
+    from rncli.terminal import is_right_ctrl
+
+    check(
+        window.act_new_tab.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["new_tab"])
+        and window.act_close_pane.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["close_pane"]),
+        "los atajos por defecto usan Ctrl+Shift+letra y no pisan a los agentes",
+    )
+    check(
+        window.act_new_tab.shortcutContext() == Qt.ShortcutContext.WindowShortcut,
+        "los atajos del chasis están siempre activos",
+    )
+    shifted_t = QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_T,
+        Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+    )
+    check(
+        window._host_action(shifted_t) is window.act_new_tab,
+        "MODO RNCli dispara la acción según la tabla configurada",
+    )
+    plain_t = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_T, Qt.KeyboardModifier.ControlModifier)
+    check(window._host_action(plain_t) is None, "Ctrl+T queda libre para los agentes")
+
+    custom = SettingsCls.from_dict(
+        {"shortcuts": {"new_tab": "Ctrl+Shift+J", "close_pane": "", "rollo este": "Ctrl+X"}}
+    )
+    check(custom.shortcuts["new_tab"] == "Ctrl+Shift+J", "config.json guarda atajos reconfigurados")
+    check(custom.shortcuts["close_pane"] == SHORTCUT_DEFAULTS["close_pane"], "un atajo vacío vuelve al defecto")
+    check("rollo este" not in custom.shortcuts, "se ignoran action_ids desconocidos")
+    check(SettingsCls.from_dict({}).shortcuts == SHORTCUT_DEFAULTS, "configs antiguas heredan los nuevos atajos")
+    check(
+        merged_shortcuts(dataclasses.replace(config.settings, shortcuts={"quit": "F9"}))["quit"] == "F9",
+        "merged_shortcuts combina defectos y cambios del usuario",
+    )
+
+    shortcuts_ui = SettingsDialog(config.settings, config.agents, window)
+    check("new_tab" in shortcuts_ui.shortcut_edits, "ajustes tiene pestaña de atajos")
+    shortcuts_ui.shortcut_preset.setCurrentIndex(1)
+    check(
+        shortcuts_ui.shortcut_edits["new_tab"].keySequence() == QKeySequence(SHORTCUT_CLASSIC["new_tab"]),
+        "el preset Clásico rellena los campos con los atajos antiguos",
+    )
+    shortcuts_ui._fill_shortcuts(SHORTCUT_DEFAULTS)
+    shortcuts_ui.shortcut_edits["new_tab"].setKeySequence(QKeySequence("Ctrl+Shift+J"))
+    saved_shortcuts = shortcuts_ui.result_settings(config.settings)
+    check(saved_shortcuts.shortcuts["new_tab"] == "Ctrl+Shift+J", "ajustes guarda el atajo reasignado")
+    shortcuts_ui.deleteLater()
+
+    class FakeKey:  # QKeyEvent no permite fijar el scan code nativo
+        def __init__(self, scan: int) -> None:
+            self._scan = scan
+
+        def key(self):
+            return Qt.Key.Key_Control
+
+        def nativeScanCode(self) -> int:
+            return self._scan
+
+        def nativeVirtualKey(self) -> int:
+            return 0
+
+    check(is_right_ctrl(FakeKey(105)), "Ctrl derecho detectado en X11")
+    check(is_right_ctrl(FakeKey(97)), "Ctrl derecho detectado en Wayland")
+    check(is_right_ctrl(FakeKey(284)), "Ctrl derecho detectado en Windows")
+    check(not is_right_ctrl(FakeKey(29)), "Ctrl izquierdo no es la Host Key")
+
+    # La Host Key también funciona con el foco fuera de la terminal (barra, explorador)
+    window.settings = dataclasses.replace(config.settings, escape_key="host")
+    window._host_mode = False
+    window.prompt.setFocus(Qt.FocusReason.OtherFocusReason)
+    wait(50)
+    check(
+        window.eventFilter(window, esc_ev) is True and window._host_mode,
+        "la Host Key abre MODO RNCli aunque el foco no esté en la terminal",
+    )
+    window._return_keyboard_to_terminal()
+    check(not window._host_mode, "la Host Key vuelve a devolver el teclado a la terminal")
+    window.settings = config.settings
+
     target = workspace.add_pane(shell, "/tmp")
     wait(200)
     if target is not None and target.terminal is not None and target.session is not None:

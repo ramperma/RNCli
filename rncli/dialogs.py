@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import ClassVar, NamedTuple
 
 from PySide6.QtCore import QProcess, Qt, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,8 +28,10 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QKeySequenceEdit,
     QSizePolicy,
     QSpinBox,
+    QTabWidget,
     QTextBrowser,
     QToolButton,
     QVBoxLayout,
@@ -38,7 +40,18 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .agents import Agent, KNOWN_AGENTS, catalog_agents, pick_default_agent
-from .config import ESCAPE_KEY_LABELS, ESCAPE_KEY_MODES, LAYOUTS, Config, Settings
+from .config import (
+    ESCAPE_KEY_LABELS,
+    ESCAPE_KEY_MODES,
+    LAYOUTS,
+    SHORTCUT_CLASSIC,
+    SHORTCUT_DEFAULTS,
+    SHORTCUT_LABELS,
+    SHORTCUT_SECTIONS,
+    Config,
+    Settings,
+    merged_shortcuts,
+)
 from .layouts import LAYOUT_LABELS
 from .shell_env import reset_cache, resolve_executable
 from .ssh_hosts import SshHost
@@ -922,7 +935,6 @@ class SettingsDialog(QDialog):
             "Escape puede ir al agente o usarse como Host Key (igual que Ctrl derecho)."
         )
         form.addRow("Tecla Escape", self.escape_combo)
-        root.addLayout(form)
 
         box = QGroupBox("Comportamiento")
         box_layout = QVBoxLayout(box)
@@ -953,7 +965,18 @@ class SettingsDialog(QDialog):
             self.toolbar_check,
         ):
             box_layout.addWidget(widget)
-        root.addWidget(box)
+
+        tabs = QTabWidget()
+        general = QWidget()
+        general_layout = QVBoxLayout(general)
+        general_layout.setContentsMargins(4, 10, 4, 4)
+        general_layout.setSpacing(12)
+        general_layout.addLayout(form)
+        general_layout.addWidget(box)
+        general_layout.addStretch(1)
+        tabs.addTab(general, "General")
+        tabs.addTab(self._build_shortcuts_tab(settings), "Atajos")
+        root.addWidget(tabs, 1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -961,6 +984,83 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    # ---------------------------------------------------------------- atajos
+    def _build_shortcuts_tab(self, settings: Settings) -> QWidget:
+        """Editor de atajos del chasis: la tabla vive en config.SHORTCUT_DEFAULTS."""
+        merged = merged_shortcuts(settings)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(10)
+
+        hint = QLabel(
+            "Pulsa la combinación en cada campo para reasignarla. Los atajos del chasis "
+            "están siempre activos; el esquema por defecto usa Ctrl+Shift+letra, "
+            "Alt+dígito y F para no coincidir con los atajos de los agentes."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Esquema"))
+        self.shortcut_preset = QComboBox()
+        self.shortcut_preset.addItem("Moderno (sin colisiones con agentes)", "moderno")
+        self.shortcut_preset.addItem("Clásico (RNCli antiguo)", "clasico")
+        self.shortcut_preset.setToolTip(
+            "El esquema Clásico usa Ctrl+T/Ctrl+W/Ctrl+Q y Alt+flechas, que coinciden "
+            "con atajos de los agentes: con él, dentro de una TUI hay que usar la "
+            "Host Key (Ctrl derecho) para los atajos del chasis."
+        )
+        self.shortcut_preset.currentIndexChanged.connect(self._apply_shortcut_preset)
+        preset_row.addWidget(self.shortcut_preset, 1)
+        restore = QPushButton("Restaurar por defecto")
+        restore.clicked.connect(lambda: self._fill_shortcuts(SHORTCUT_DEFAULTS))
+        preset_row.addWidget(restore)
+        layout.addLayout(preset_row)
+
+        self.shortcut_edits: dict[str, QKeySequenceEdit] = {}
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        grid = QGridLayout(body)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(8)
+        row = 0
+        for section, action_ids in SHORTCUT_SECTIONS:
+            grid.addWidget(QLabel(f"<b>{section}</b>"), row, 0, 1, 2)
+            row += 1
+            for action_id in action_ids:
+                grid.addWidget(QLabel(SHORTCUT_LABELS.get(action_id, action_id)), row, 0)
+                edit = QKeySequenceEdit(QKeySequence(merged.get(action_id, "")))
+                edit.setMaximumSequenceLength(1)
+                self.shortcut_edits[action_id] = edit
+                grid.addWidget(edit, row, 1)
+                row += 1
+        grid.setRowStretch(row, 1)
+        grid.setColumnStretch(1, 1)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, 1)
+        return page
+
+    def _apply_shortcut_preset(self) -> None:
+        preset = str(self.shortcut_preset.currentData() or "moderno")
+        table = dict(SHORTCUT_DEFAULTS)
+        if preset == "clasico":
+            table.update(SHORTCUT_CLASSIC)
+        self._fill_shortcuts(table)
+
+    def _fill_shortcuts(self, table: dict[str, str]) -> None:
+        for action_id, edit in self.shortcut_edits.items():
+            edit.setKeySequence(QKeySequence(table.get(action_id, "")))
+
+    def _result_shortcuts(self) -> dict:
+        shortcuts = dict(SHORTCUT_DEFAULTS)
+        for action_id, edit in self.shortcut_edits.items():
+            sequence = edit.keySequence().toString()
+            if sequence:
+                shortcuts[action_id] = sequence
+        return shortcuts
 
     def _reload_agent_combo(self, selected_id: str | None = None) -> None:
         current_data = (
@@ -1007,57 +1107,50 @@ class SettingsDialog(QDialog):
             escape_key=str(self.escape_combo.currentData() or "terminal"),
             show_hidden_files=self.hidden_check.isChecked(),
             show_toolbar=self.toolbar_check.isChecked(),
+            shortcuts=self._result_shortcuts(),
         )
 
 
 # --------------------------------------------------------------------------- ayuda
 class ShortcutsDialog(QDialog):
-    SHORTCUTS: ClassVar[list[tuple[str, str | None]]] = [
-        ("Pestañas y paneles", None),
-        ("Ctrl+T", "Nueva pestaña (elige agente)"),
-        ("Ctrl+Shift+T", "Nuevo panel en la pestaña actual"),
-        ("Ctrl+Shift+S", "Nueva conexión SSH a un equipo remoto (se guarda en config.json)"),
-        ("Ctrl+W", "Cerrar el panel activo"),
-        ("Ctrl+Shift+W", "Cerrar la pestaña"),
-        ("F2", "Renombrar la pestaña"),
-        ("Ctrl+Tab / Ctrl+Shift+Tab", "Pestaña siguiente / anterior"),
-        ("Diseño", None),
-        ("Alt+1", "Solo el panel activo (1 visible)"),
-        ("Alt+2", "Dos paneles en paralelo"),
-        ("Alt+3", "Dos paneles apilados"),
-        ("Alt+4", "Rejilla 2×2"),
-        ("Alt+5", "Rejilla 3×2"),
-        ("Alt+0", "Todos los paneles visibles"),
-        ("Alt+→ / Alt+←", "Enfocar el panel siguiente / anterior"),
-        ("Ctrl+Shift+M", "Maximizar el panel activo (solo 1 visible)"),
+    """Ayuda F1: la tabla de atajos del chasis se genera desde la configuración."""
+
+    STATIC_ROWS: ClassVar[list[tuple[str, str | None]]] = [
         ("Terminal", None),
-        ("Ctrl+Shift+C / Ctrl+Shift+V", "Copiar / pegar"),
+        ("Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+A", "Copiar / pegar / seleccionar todo"),
         ("Tab / Shift+Tab", "Siempre al terminal seleccionado (cursor-agent, Pi…)"),
-        ("Ctrl derecho", "Host Key tipo VirtualBox: libera el foco y activa los atajos de RNCli"),
+        ("Ctrl derecho", "Host Key tipo VirtualBox: MODO RNCli (foco en menús y barra inferior)"),
         ("Escape", "Configurable en Ajustes: al terminal o Host Key de RNCli"),
         ("Shift+PageUp / Shift+PageDown", "Desplazarse por el historial"),
-        ("Rueda del ratón", "Historial de la terminal"),
-        ("Ctrl+Shift+B", "Activar/desactivar difusión (escribir en todos)"),
-        ("Ctrl+Shift+R", "Reiniciar el agente activo"),
-        ("Explorador", "Archivos y carpetas: arrastra un archivo a un terminal o usa «Pegar archivo»"),
-        ("··· en la barra", "Unir pestañas, reiniciar, sudo y ayuda"),
-        ("Ocultar en la barra / Ver → Barra de herramientas", "Ocultar o mostrar la barra superior (más espacio en portátiles)"),
+        ("Rueda del ratón", "Desplaza la TUI si pide el ratón (OpenCode); si no, el historial"),
+        ("Shift + rueda", "Historial de la terminal aunque la TUI use el ratón"),
         ("Ctrl+H", "En el explorador: mostrar u ocultar archivos ocultos"),
-        ("Ctrl++ / Ctrl+- / Ctrl+0", "Tamaño de letra"),
-        ("F11", "Pantalla completa"),
-        ("Ctrl+Q", "Salir"),
+        ("··· en la barra", "Unir pestañas, reiniciar, sudo y ayuda"),
+        ("Ocultar en la barra / Ver → Barra de herramientas", "Ocultar o mostrar la barra superior"),
     ]
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, shortcuts: dict | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · atajos y ayuda")
         self.resize(640, 660)
+        table = dict(SHORTCUT_DEFAULTS)
+        if isinstance(shortcuts, dict):
+            for action_id, sequence in shortcuts.items():
+                if action_id in table and isinstance(sequence, str) and sequence:
+                    table[action_id] = sequence
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
         root.setSpacing(12)
         browser = QTextBrowser()
         rows = []
-        for key, description in self.SHORTCUTS:
+        for section, action_ids in SHORTCUT_SECTIONS:
+            rows.append(f"<tr><td colspan='2' style='padding-top:10px'><b>{section}</b></td></tr>")
+            for action_id in action_ids:
+                rows.append(
+                    f"<tr><td style='padding-right:14px'><code>{table.get(action_id, '')}</code>"
+                    f"</td><td>{SHORTCUT_LABELS.get(action_id, action_id)}</td></tr>"
+                )
+        for key, description in self.STATIC_ROWS:
             if description is None:
                 rows.append(f"<tr><td colspan='2' style='padding-top:10px'><b>{key}</b></td></tr>")
             else:
@@ -1068,8 +1161,10 @@ class ShortcutsDialog(QDialog):
             f"<h3>{APP_NAME} {__version__}</h3>"
             "<p>Multiplexor de terminales para agentes de IA: varios agentes a la vez, "
             "en pestañas y diseños, cada uno en su propia terminal real.</p>"
+            "<p>Los atajos del chasis son configurables en Ajustes → Atajos.</p>"
             f"<table cellspacing='0'>{''.join(rows)}</table>"
-            "<p style='margin-top:12px'><b>Consejo:</b> activa la difusión (Ctrl+Shift+B) para escribir "
+            "<p style='margin-top:12px'><b>Consejo:</b> activa la difusión "
+            f"({table.get('broadcast', 'Ctrl+Shift+B')}) para escribir "
             "la misma orden en todos los paneles del diseño a la vez.</p>"
         )
         browser.setOpenExternalLinks(True)

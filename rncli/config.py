@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import Path
 
 from .agents import Agent, default_agents
@@ -21,6 +21,101 @@ ESCAPE_KEY_LABELS = {
     "terminal": "Al terminal seleccionado (agentes, vim…)",
     "host": "Host Key de RNCli (como Ctrl derecho)",
 }
+
+# ---------------------------------------------------------------- atajos chasis
+# Única fuente de verdad: action_id -> secuencia. El esquema por defecto vive en
+# el espacio Ctrl+Shift+letra / Alt+dígito / F, que los agentes no usan, para que
+# los atajos del chasis estén siempre activos sin robarles teclas.
+SHORTCUT_DEFAULTS: dict[str, str] = {
+    "new_tab": "Ctrl+Shift+T",
+    "new_pane": "Ctrl+Shift+D",
+    "new_ssh": "Ctrl+Shift+S",
+    "close_pane": "Ctrl+Shift+W",
+    "close_tab": "Ctrl+Shift+X",
+    "rename_tab": "F2",
+    "next_tab": "Ctrl+Tab",
+    "prev_tab": "Ctrl+Shift+Tab",
+    "quit": "Ctrl+Shift+Q",
+    "restart": "Ctrl+Shift+R",
+    "focus_next": "Ctrl+Shift+Right",
+    "focus_prev": "Ctrl+Shift+Left",
+    "maximize": "Ctrl+Shift+M",
+    "broadcast": "Ctrl+Shift+B",
+    "zoom_in": "Ctrl+=",
+    "zoom_out": "Ctrl+-",
+    "zoom_reset": "Ctrl+0",
+    "fullscreen": "F11",
+    "help": "F1",
+    "layout_1": "Alt+1",
+    "layout_2v": "Alt+2",
+    "layout_2h": "Alt+3",
+    "layout_4": "Alt+4",
+    "layout_6": "Alt+5",
+    "layout_all": "Alt+0",
+}
+
+# Preset con los atajos simples del RNCli clásico. Ojo: Ctrl+T/Ctrl+W/Ctrl+Q y
+# Alt+flechas coinciden con atajos de los agentes; con este preset hay que usar
+# la Host Key (Ctrl derecho) para que el chasis funcione dentro de una TUI.
+SHORTCUT_CLASSIC: dict[str, str] = {
+    "new_tab": "Ctrl+T",
+    "new_pane": "Ctrl+Shift+T",
+    "close_pane": "Ctrl+W",
+    "close_tab": "Ctrl+Shift+W",
+    "quit": "Ctrl+Q",
+    "focus_next": "Alt+Right",
+    "focus_prev": "Alt+Left",
+}
+
+SHORTCUT_LABELS: dict[str, str] = {
+    "new_tab": "Nueva pestaña (elige agente)",
+    "new_pane": "Nuevo panel en la pestaña actual",
+    "new_ssh": "Nueva conexión SSH",
+    "close_pane": "Cerrar el panel activo",
+    "close_tab": "Cerrar la pestaña",
+    "rename_tab": "Renombrar la pestaña",
+    "next_tab": "Pestaña siguiente",
+    "prev_tab": "Pestaña anterior",
+    "quit": "Salir",
+    "restart": "Reiniciar el agente activo",
+    "focus_next": "Enfocar el panel siguiente",
+    "focus_prev": "Enfocar el panel anterior",
+    "maximize": "Maximizar el panel activo",
+    "broadcast": "Difusión (escribir en todos)",
+    "zoom_in": "Aumentar letra",
+    "zoom_out": "Reducir letra",
+    "zoom_reset": "Tamaño de letra normal",
+    "fullscreen": "Pantalla completa",
+    "help": "Atajos y ayuda",
+    "layout_1": "Diseño: solo el panel activo",
+    "layout_2v": "Diseño: dos paneles en paralelo",
+    "layout_2h": "Diseño: dos paneles apilados",
+    "layout_4": "Diseño: rejilla 2×2",
+    "layout_6": "Diseño: rejilla 3×2",
+    "layout_all": "Diseño: todos los paneles",
+}
+
+# Orden para la ayuda (F1) y la pestaña de atajos de Ajustes.
+SHORTCUT_SECTIONS: list[tuple[str, list[str]]] = [
+    ("Pestañas y paneles", ["new_tab", "new_pane", "new_ssh", "close_pane", "close_tab",
+                            "rename_tab", "next_tab", "prev_tab"]),
+    ("Diseño y paneles", ["layout_1", "layout_2v", "layout_2h", "layout_4", "layout_6",
+                          "layout_all", "focus_next", "focus_prev", "maximize"]),
+    ("Agente", ["restart", "broadcast"]),
+    ("Vista y salida", ["zoom_in", "zoom_out", "zoom_reset", "fullscreen", "help", "quit"]),
+]
+
+
+def merged_shortcuts(settings: "Settings") -> dict[str, str]:
+    """Tabla completa: defaults cubiertos por lo que el usuario haya cambiado."""
+    custom = getattr(settings, "shortcuts", None)
+    if not isinstance(custom, dict):
+        custom = {}
+    merged = dict(SHORTCUT_DEFAULTS)
+    for action_id, sequence in custom.items():
+        if action_id in SHORTCUT_DEFAULTS and isinstance(sequence, str) and sequence:
+            merged[action_id] = sequence
+    return merged
 
 
 @dataclass
@@ -40,6 +135,7 @@ class Settings:
     escape_key: str = "terminal"       # terminal | host
     show_hidden_files: bool = False
     show_toolbar: bool = True
+    shortcuts: dict = field(default_factory=lambda: dict(SHORTCUT_DEFAULTS))
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -51,7 +147,17 @@ class Settings:
         for key, value in (data or {}).items():
             if key not in known:
                 continue
-            default = known[key].default
+            spec = known[key]
+            if spec.default_factory not in (None, MISSING):
+                # campos dict (shortcuts): solo cadenas no vacías para ids conocidos
+                if isinstance(value, dict):
+                    clean[key] = {
+                        action_id: str(sequence)
+                        for action_id, sequence in value.items()
+                        if action_id in SHORTCUT_DEFAULTS and isinstance(sequence, str) and sequence
+                    }
+                continue
+            default = spec.default
             try:
                 if isinstance(default, bool):
                     value = bool(value)
@@ -68,6 +174,8 @@ class Settings:
             clean["theme"] = "oscuro"
         if clean.get("escape_key") not in ESCAPE_KEY_MODES:
             clean["escape_key"] = "terminal"
+        if "shortcuts" in clean:
+            clean["shortcuts"] = {**SHORTCUT_DEFAULTS, **clean["shortcuts"]}
         return cls(**clean)
 
 

@@ -114,10 +114,16 @@ _HOST_MODS = _NAV_MODS | Qt.KeyboardModifier.ShiftModifier
 
 
 def is_right_ctrl(event) -> bool:
-    """Ctrl derecho (scan code 105 / keysym 65508), Host Key tipo VirtualBox."""
-    return event.key() == Qt.Key.Key_Control and (
-        event.nativeScanCode() == 105 or event.nativeVirtualKey() in (65508, 0xFFE4)
-    )
+    """Ctrl derecho, Host Key tipo VirtualBox.
+
+    Códigos nativos por plataforma: X11 usa el keycode 105, Wayland el evdev 97
+    y Windows el scan code extendido 284. El keysym 0xFFE4 cubre X11/Qt.
+    """
+    if event.key() != Qt.Key.Key_Control:
+        return False
+    if event.nativeScanCode() in (105, 97, 284):
+        return True
+    return event.nativeVirtualKey() in (65508, 0xFFE4)
 
 
 def is_host_key(event, settings) -> bool:

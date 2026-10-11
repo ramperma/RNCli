@@ -26,7 +26,14 @@ from PySide6.QtWidgets import (
 
 from . import APP_NAME, __version__
 from .agents import Agent, pick_default_agent
-from .config import LAYOUTS, Config, Settings, load_session, save_session
+from .config import (
+    LAYOUTS,
+    Config,
+    Settings,
+    load_session,
+    merged_shortcuts,
+    save_session,
+)
 from .dialogs import (
     AgentChooserDialog,
     AgentManagerDialog,
@@ -87,6 +94,8 @@ class MainWindow(QMainWindow):
         self._zoom_applied = 0
         self._host_mode = False
         self._shortcut_actions: list[QAction] = []
+        # Tabla única de atajos (action_id -> secuencia); ver config.SHORTCUT_DEFAULTS.
+        self._shortcuts = merged_shortcuts(self.settings)
 
         self.setWindowTitle(APP_NAME)
         self.resize(1400, 900)
@@ -98,9 +107,9 @@ class MainWindow(QMainWindow):
         self._build_file_browser()
         self._build_statusbar()
         self._build_prompt()
-        # Mientras una terminal tiene el foco, Ctrl+T/Ctrl+W/etc. pertenecen
-        # al agente. Los atajos del chasis se habilitan con Ctrl derecho.
-        self._set_app_shortcuts(False)
+        # Los atajos del chasis viven en el espacio Ctrl+Shift+letra / Alt+dígito / F,
+        # que los agentes no usan, así que están siempre activos. Ctrl derecho sigue
+        # abriendo el MODO RNCli (menús, ratón y presets clásicos con colisiones).
         self._restore_geometry()
 
         self._restore_or_create_session()
@@ -128,6 +137,14 @@ class MainWindow(QMainWindow):
             self._return_keyboard_to_terminal()
             event.accept()
             return True
+        if not self._host_mode and is_host_key(event, self.settings) and not isinstance(
+            focus, TerminalWidget
+        ):
+            # La Host Key también funciona con el foco en la barra inferior o el
+            # explorador (la terminal solo la escucha cuando tiene el foco).
+            self._enter_host_mode(None)
+            event.accept()
+            return True
         if self._host_mode:
             action = self._host_action(event)
             if action is not None:
@@ -142,114 +159,75 @@ class MainWindow(QMainWindow):
         return "Ctrl derecho"
 
     def _host_action(self, event) -> QAction | None:
-        key = event.key()
-        mods = event.modifiers()
-        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
-        shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
-        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
-
-        if ctrl and shift and key == Qt.Key.Key_T:
-            return self.act_new_pane
-        if ctrl and not shift and key == Qt.Key.Key_T:
-            return self.act_new_tab
-        if ctrl and shift and key == Qt.Key.Key_W:
-            return self.act_close_tab
-        if ctrl and not shift and key == Qt.Key.Key_W:
-            return self.act_close_pane
-        if ctrl and shift and key == Qt.Key.Key_B:
-            return self.act_broadcast
-        if ctrl and shift and key == Qt.Key.Key_S:
-            return self.act_new_ssh
-        if ctrl and shift and key == Qt.Key.Key_R:
-            return self.act_restart
-        if ctrl and shift and key == Qt.Key.Key_M:
-            return self.act_maximize
-        if ctrl and shift and key == Qt.Key.Key_C:
-            return self._host_copy_action
-        if ctrl and shift and key == Qt.Key.Key_V:
-            return self._host_paste_action
-        if ctrl and shift and key == Qt.Key.Key_A:
-            return self._host_select_action
-        if ctrl and key == Qt.Key.Key_Tab:
-            return self.act_prev_tab if shift else self.act_next_tab
-        if ctrl and key in (Qt.Key.Key_Equal, Qt.Key.Key_Plus):
-            return self.act_zoom_in
-        if ctrl and key in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
-            return self.act_zoom_out
-        if ctrl and key == Qt.Key.Key_0:
-            return self.act_zoom_reset
-        if ctrl and key == Qt.Key.Key_Q:
-            return self.act_quit
-        if alt:
-            modes = {
-                Qt.Key.Key_1: "1", Qt.Key.Key_2: "2v", Qt.Key.Key_3: "2h",
-                Qt.Key.Key_4: "4", Qt.Key.Key_5: "6", Qt.Key.Key_0: "all",
-            }
-            if key in modes:
-                return self.act_layouts[modes[key]]
-            if key == Qt.Key.Key_Right:
-                return self.act_focus_next
-            if key == Qt.Key.Key_Left:
-                return self.act_focus_prev
-        if key == Qt.Key.Key_F1:
-            return self.act_help
-        if key == Qt.Key.Key_F2:
-            return self.act_rename_tab
-        if key == Qt.Key.Key_F11:
-            return self.act_fullscreen
-        return None
+        """Acción del chasis cuya secuencia coincide con la tecla pulsada."""
+        seq = QKeySequence(event.key() | event.modifiers().value)
+        if seq.isEmpty():
+            return None
+        for action in self._shortcut_actions:
+            if seq in action.shortcuts():
+                return action
+        # Copiar/pegar/seleccionar son de nivel terminal (no configurables); en
+        # MODO RNCli el foco está en la barra, así que los atendemos aquí.
+        fixed = {
+            QKeySequence("Ctrl+Shift+C"): self._host_copy_action,
+            QKeySequence("Ctrl+Shift+V"): self._host_paste_action,
+            QKeySequence("Ctrl+Shift+A"): self._host_select_action,
+        }
+        return fixed.get(seq)
 
     # ------------------------------------------------------------------ acciones
-    def _act(self, text: str, shortcut: str | None, slot, *, checkable: bool = False) -> QAction:
+    def _act(self, action_id: str, text: str, slot, *, checkable: bool = False) -> QAction:
+        """Acción del chasis; su atajo sale de la tabla (config.SHORTCUT_DEFAULTS)."""
         action = QAction(text, self)
-        if shortcut:
-            action.setShortcut(QKeySequence(shortcut))
-            action.setProperty("rncliShortcut", shortcut)
+        action.setProperty("rncliShortcutId", action_id)
+        if action_id in self._shortcuts:
             self._shortcut_actions.append(action)
+            self._apply_shortcut(action)
         action.setCheckable(checkable)
         action.triggered.connect(slot)
         self.addAction(action)
         return action
 
-    def _set_app_shortcuts(self, enabled: bool) -> None:
-        """Activa/desactiva atajos del chasis sin desactivar sus acciones de menú."""
+    def _apply_shortcut(self, action: QAction) -> None:
+        action_id = str(action.property("rncliShortcutId") or "")
+        sequence = self._shortcuts.get(action_id, "")
+        if action_id == "zoom_in":
+            action.setShortcuts([QKeySequence(sequence), QKeySequence("Ctrl++")])
+        else:
+            action.setShortcut(QKeySequence(sequence) if sequence else QKeySequence())
+
+    def _apply_shortcuts(self) -> None:
+        """Recarga la tabla tras cambiar los atajos en Ajustes."""
+        self._shortcuts = merged_shortcuts(self.settings)
         for action in self._shortcut_actions:
-            shortcut = action.property("rncliShortcut")
-            action.setShortcut(QKeySequence(str(shortcut)) if enabled and shortcut else QKeySequence())
+            self._apply_shortcut(action)
 
     def _build_actions(self) -> None:
-        self.act_new_tab = self._act("Nueva pestaña", "Ctrl+T", lambda: self.choose_agent(new_tab=True))
-        self.act_new_pane = self._act(
-            "Nuevo panel", "Ctrl+Shift+T", lambda: self.choose_agent(new_tab=False)
-        )
-        self.act_close_pane = self._act("Cerrar panel", "Ctrl+W", self.close_pane)
-        self.act_close_tab = self._act("Cerrar pestaña", "Ctrl+Shift+W", self.close_tab)
-        self.act_rename_tab = self._act("Renombrar pestaña", "F2", self.rename_tab)
-        self.act_next_tab = self._act("Pestaña siguiente", "Ctrl+Tab", lambda: self._cycle_tab(1))
-        self.act_prev_tab = self._act("Pestaña anterior", "Ctrl+Shift+Tab", lambda: self._cycle_tab(-1))
-        self.act_quit = self._act("Salir", "Ctrl+Q", self.close)
-        self.act_restart = self._act("Reiniciar agente", "Ctrl+Shift+R", self.restart_active)
-        self.act_focus_next = self._act("Panel siguiente", "Alt+Right", lambda: self._focus(1))
-        self.act_focus_prev = self._act("Panel anterior", "Alt+Left", lambda: self._focus(-1))
-        self.act_zoom_in = self._act("Aumentar letra", "Ctrl+=", lambda: self.zoom(+1))
-        self.act_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
-        self.act_zoom_out = self._act("Reducir letra", "Ctrl+-", lambda: self.zoom(-1))
-        self.act_zoom_reset = self._act("Tamaño normal", "Ctrl+0", lambda: self.zoom(reset=True))
-        self.act_maximize = self._act(
-            "Maximizar panel activo", "Ctrl+Shift+M", self.maximize_active
-        )
-        self.act_fullscreen = self._act("Pantalla completa", "F11", self.toggle_fullscreen, checkable=True)
+        self.act_new_tab = self._act("new_tab", "Nueva pestaña", lambda: self.choose_agent(new_tab=True))
+        self.act_new_pane = self._act("new_pane", "Nuevo panel", lambda: self.choose_agent(new_tab=False))
+        self.act_close_pane = self._act("close_pane", "Cerrar panel", self.close_pane)
+        self.act_close_tab = self._act("close_tab", "Cerrar pestaña", self.close_tab)
+        self.act_rename_tab = self._act("rename_tab", "Renombrar pestaña", self.rename_tab)
+        self.act_next_tab = self._act("next_tab", "Pestaña siguiente", lambda: self._cycle_tab(1))
+        self.act_prev_tab = self._act("prev_tab", "Pestaña anterior", lambda: self._cycle_tab(-1))
+        self.act_quit = self._act("quit", "Salir", self.close)
+        self.act_restart = self._act("restart", "Reiniciar agente", self.restart_active)
+        self.act_focus_next = self._act("focus_next", "Panel siguiente", lambda: self._focus(1))
+        self.act_focus_prev = self._act("focus_prev", "Panel anterior", lambda: self._focus(-1))
+        self.act_zoom_in = self._act("zoom_in", "Aumentar letra", lambda: self.zoom(+1))
+        self.act_zoom_out = self._act("zoom_out", "Reducir letra", lambda: self.zoom(-1))
+        self.act_zoom_reset = self._act("zoom_reset", "Tamaño normal", lambda: self.zoom(reset=True))
+        self.act_maximize = self._act("maximize", "Maximizar panel activo", self.maximize_active)
+        self.act_fullscreen = self._act("fullscreen", "Pantalla completa", self.toggle_fullscreen, checkable=True)
         self.act_broadcast = self._act(
-            "Difusión (escribir en todos)", "Ctrl+Shift+B", self.toggle_broadcast, checkable=True
+            "broadcast", "Difusión (escribir en todos)", self.toggle_broadcast, checkable=True
         )
-        self.act_new_ssh = self._act(
-            "Nueva conexión SSH…", "Ctrl+Shift+S", lambda: self.choose_ssh()
-        )
-        self.act_manage_agents = self._act("Asistente de agentes…", None, self.open_agent_manager)
-        self.act_settings = self._act("Ajustes…", None, self.open_settings)
-        self.act_open_config = self._act("Abrir config.json", None, self.open_config)
-        self.act_sudo = self._act("Sudo para agentes…", None, self.open_sudo)
-        self.act_help = self._act("Atajos y ayuda", "F1", self.open_help)
+        self.act_new_ssh = self._act("new_ssh", "Nueva conexión SSH…", lambda: self.choose_ssh())
+        self.act_manage_agents = self._act("manage_agents", "Asistente de agentes…", self.open_agent_manager)
+        self.act_settings = self._act("settings", "Ajustes…", self.open_settings)
+        self.act_open_config = self._act("open_config", "Abrir config.json", self.open_config)
+        self.act_sudo = self._act("sudo", "Sudo para agentes…", self.open_sudo)
+        self.act_help = self._act("help", "Atajos y ayuda", self.open_help)
 
         # Acciones internas que se disparan desde el Host Key aunque el foco
         # esté temporalmente en la barra inferior.
@@ -263,10 +241,12 @@ class MainWindow(QMainWindow):
         self.layout_group = QActionGroup(self)
         self.layout_group.setExclusive(True)
         self.act_layouts: dict[str, QAction] = {}
-        for index, mode in enumerate(LAYOUTS):
-            shortcut = "Alt+0" if mode == "all" else f"Alt+{index + 1}"
+        for mode in LAYOUTS:
             action = self._act(
-                f"Diseño: {LAYOUT_LABELS[mode]}", shortcut, lambda _=False, m=mode: self.set_layout(m), checkable=True
+                f"layout_{mode}",
+                f"Diseño: {LAYOUT_LABELS[mode]}",
+                lambda _=False, m=mode: self.set_layout(m),
+                checkable=True,
             )
             self.layout_group.addAction(action)
             self.act_layouts[mode] = action
@@ -368,17 +348,17 @@ class MainWindow(QMainWindow):
 
         new_pane = self._chrome_button(
             "+ Panel",
-            "Nuevo panel en esta pestaña (Ctrl+Shift+T)",
+            f"Nuevo panel en esta pestaña ({self._shortcuts.get('new_pane', '')})",
             lambda: self.choose_agent(new_tab=False),
         )
         new_tab = self._chrome_button(
             "Pestaña",
-            "Nueva pestaña (Ctrl+T)",
+            f"Nueva pestaña ({self._shortcuts.get('new_tab', '')})",
             lambda: self.choose_agent(new_tab=True),
         )
         new_ssh = self._chrome_button(
             "SSH",
-            "Conectar por SSH a un equipo remoto (Ctrl+Shift+S)",
+            f"Conectar por SSH a un equipo remoto ({self._shortcuts.get('new_ssh', '')})",
             lambda: self.choose_ssh(),
         )
         self.toolbar.addWidget(new_pane)
@@ -402,7 +382,7 @@ class MainWindow(QMainWindow):
             button = QToolButton()
             button.setObjectName("SegmentButton")
             button.setText(LAYOUT_SHORT[mode])
-            shortcut = self.act_layouts[mode].property("rncliShortcut") or ""
+            shortcut = self._shortcuts.get(f"layout_{mode}", "")
             button.setToolTip(f"{LAYOUT_LABELS[mode]}  ({shortcut})")
             button.setCheckable(True)
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -414,7 +394,8 @@ class MainWindow(QMainWindow):
 
         broadcast = self._chrome_button(
             "Difusión",
-            "Lo que escribas se envía a todos los paneles de la pestaña (Ctrl+Shift+B)",
+            f"Lo que escribas se envía a todos los paneles de la pestaña "
+            f"({self._shortcuts.get('broadcast', '')})",
             checkable=True,
         )
         broadcast.toggled.connect(self._on_broadcast_button)
@@ -482,7 +463,7 @@ class MainWindow(QMainWindow):
         plus = QToolButton()
         plus.setObjectName("IconButton")
         plus.setText("＋")
-        plus.setToolTip("Nueva pestaña (Ctrl+T)")
+        plus.setToolTip(f"Nueva pestaña ({self._shortcuts.get('new_tab', '')})")
         plus.setFixedSize(28, 28)
         plus.setAutoRaise(True)
         plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -865,8 +846,6 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, _index: int) -> None:
         workspace = self.workspace()
-        if not self._host_mode:
-            self._set_app_shortcuts(False)
         if workspace is not None:
             if not self._host_mode:
                 workspace.focus_terminal()
@@ -881,14 +860,11 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def _on_workspace_active(self, _pane) -> None:
-        if not self._host_mode:
-            self._set_app_shortcuts(False)
         self._update_status()
 
     def _exit_host_mode(self, _pane) -> None:
         """El usuario hizo clic en una terminal: devolverle el teclado."""
         self._host_mode = False
-        self._set_app_shortcuts(False)
         self._set_prompt_host_mode(False)
         self._update_status()
 
@@ -903,13 +879,12 @@ class MainWindow(QMainWindow):
     def _enter_host_mode(self, pane) -> None:
         """VirtualBox-style Host Key: libera el foco de la TUI."""
         self._host_mode = True
-        self._set_app_shortcuts(True)
         self._set_prompt_host_mode(True)
         self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
         hint = self._host_key_hint()
         self.statusBar().showMessage(
-            "MODO RNCli: atajos activos. Ctrl+W, Ctrl+Shift+T, Alt+1… funcionan aquí. "
-            f"Haz clic en una terminal o pulsa {hint} para escribir.",
+            "MODO RNCli: foco en el chasis (menús y atajos). "
+            f"Haz clic en una terminal o pulsa {hint} para volver a escribir.",
             8000,
         )
 
@@ -1080,6 +1055,7 @@ class MainWindow(QMainWindow):
         self.settings = dialog.result_settings(self.settings)
         self.config.settings = self.settings
         self.config.save()
+        self._apply_shortcuts()
         self._restore_session = True
         self.apply_theme()
         self._apply_settings_to_workspaces()
@@ -1151,7 +1127,7 @@ class MainWindow(QMainWindow):
         )
 
     def open_help(self) -> None:
-        ShortcutsDialog(self).exec()
+        ShortcutsDialog(self, shortcuts=self._shortcuts).exec()
 
     def open_about(self) -> None:
         QMessageBox.about(

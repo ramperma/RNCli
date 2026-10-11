@@ -43,7 +43,7 @@ También se puede ejecutar directamente una vez creado el entorno:
 ## Cómo se usa
 
 ### Elegir agente
-`Ctrl+T` (pestaña nueva) o `Ctrl+Shift+T` (panel nuevo en la pestaña actual) abre el
+`Ctrl+Shift+T` (pestaña nueva) o `Ctrl+Shift+D` (panel nuevo en la pestaña actual) abre el
 selector: pulsa el **número** del agente o haz clic. También hay un campo para escribir
 un **comando propio** (por ejemplo `opencode --model sonnet`).
 
@@ -54,7 +54,7 @@ tooltip explica cómo poner su ruta a mano en `config.json`.
 ### Conexiones SSH a equipos remotos
 
 `Ctrl+Shift+S` (o el botón **SSH** de la barra, o `Sesión → Nueva conexión SSH…`, o la
-opción **Conexión SSH** dentro del selector de `Ctrl+T` / `Ctrl+Shift+T`, o `···` → Más
+opción **Conexión SSH** dentro del selector de `Ctrl+Shift+T` / `Ctrl+Shift+D`, o `···` → Más
 acciones) abre un diálogo para conectarte a otra máquina. Rellena **usuario**, **host**, **puerto**,
 **clave privada** y las **opciones de ssh** que necesites (`-L 8080:localhost:80`,
 `-X`, `StrictHostKeyChecking=accept-new`…), o escribe el destino directamente
@@ -92,7 +92,7 @@ de esa sesión. Para ver agentes que ya abriste en pestañas lado a lado, pulsa
 y después elige un diseño en la barra (`1`, `2`, `4`…). Si eliges un diseño con varias
 pestañas abiertas, RNCli también te ofrece esa conversión automáticamente.
 
-En enfocar con `Alt+←` / `Alt+→`, el panel activo siempre entra en el diseño visible.
+En enfocar con `Ctrl+Shift+←` / `Ctrl+Shift+→`, el panel activo siempre entra en el diseño visible.
 
 ### Difusión (una orden para todos)
 `Ctrl+Shift+B` activa la difusión `⇢`: todo lo que escribas se envía **también** a los
@@ -127,20 +127,31 @@ con el botón **Ocultar** (o `Ver → Barra de herramientas`) para ganar espacio
 ### Otros atajos
 | Atajo | Acción |
 |-------|--------|
+| `Ctrl+Shift+T` | Nueva pestaña |
+| `Ctrl+Shift+D` | Nuevo panel en la pestaña actual |
 | `Ctrl+Shift+S` | Nueva conexión SSH a un equipo remoto |
-| `Ctrl+W` / `Ctrl+Shift+W` | Cerrar panel / pestaña |
+| `Ctrl+Shift+W` / `Ctrl+Shift+X` | Cerrar panel / pestaña |
 | `F2` | Renombrar pestaña |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Pestaña siguiente / anterior |
+| `Ctrl+Shift+→` / `Ctrl+Shift+←` | Enfocar panel siguiente / anterior |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copiar / pegar |
 | **Tab** / **Shift+Tab** | Siempre al terminal seleccionado (cursor-agent, Pi…) |
-| **Ctrl derecho** | Host Key tipo VirtualBox: libera el foco de la terminal y activa los atajos de RNCli |
+| **Ctrl derecho** | Host Key tipo VirtualBox: libera el foco (MODO RNCli: menús y barra) |
 | **Escape** | Configurable en Ajustes: al terminal o Host Key |
-| `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal (también la rueda) |
+| `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
+| Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
 | `Ctrl+Shift+R` | Reiniciar el agente activo (`Enter` en una terminal terminada) |
 | `Ctrl++` / `Ctrl+-` / `Ctrl+0` | Tamaño de letra |
 | `F11` | Pantalla completa |
 | `F1` | Todos los atajos |
-| `Ctrl+Q` | Salir (cierra también los agentes) |
+| `Ctrl+Shift+Q` | Salir (cierra también los agentes) |
+
+Los atajos del chasis son **configurables** en `Ajustes → Atajos` (o editando el mapa
+`shortcuts` de `config.json`). El esquema por defecto usa `Ctrl+Shift+letra`, `Alt+dígito`
+y teclas `F`, que los agentes no emplean, así que los atajos de RNCli funcionan **siempre**,
+también con una TUI enfocada. `Ctrl+letra` a secas queda libre para los agentes. Hay un
+preset **Clásico (RNCli antiguo)** con `Ctrl+T` / `Ctrl+W` / `Ctrl+Q`; ten en cuenta que
+esas teclas sí las usan los agentes, y con ese esquema necesitarás la Host Key para el chasis.
 
 ## Instalación en el menú de aplicaciones
 
@@ -271,19 +282,23 @@ quieres volver a pyte sin desinstalar nada, borra el `.so` de `rncli_native`
 
 ### Limitaciones conocidas
 
-* No se envían eventos de ratón a las TUI; el ratón se usa para seleccionar texto,
-  pegar (botón central) y desplazar el historial.
+* La rueda del ratón sí se envía a las TUI que piden seguimiento de ratón (OpenCode);
+  el resto del ratón se usa para seleccionar texto y pegar (botón central).
 * No hay soporte de imágenes (sixel/kitty graphics).
-* Los atajos con `Alt` son de RNCli, así que no llegan a los agentes.
+* Los atajos `Alt+dígito` de los diseños son de RNCli, así que no llegan a los agentes.
 
 ### Host Key tipo VirtualBox
 
-Cuando una TUI tiene el foco, sus atajos tienen prioridad: por ejemplo, `Ctrl+T` de
-OpenCode, `Tab` de cursor-agent y `Shift+Tab` de Pi llegan al agente y no los roba RNCli.
-Pulsa **Ctrl derecho** (o **Escape**, si lo activas en Ajustes → Tecla Escape) solo cuando
-quieras usar los atajos del chasis (`Ctrl+W`, `Ctrl+Shift+T`, `Ctrl+Tab`, `Alt+2`, etc.).
-Eso activa `MODO RNCli`; haz clic en cualquier terminal o pulsa la Host Key otra vez para
-volver a escribir en ella.
+Los atajos del chasis usan `Ctrl+Shift+letra`, `Alt+dígito` y teclas `F`, un espacio que
+los agentes no emplean, así que funcionan **siempre**: con `Ctrl+Shift+T` se abre una
+pestaña nueva aunque OpenCode tenga el foco. `Ctrl+letra` a secas queda 100% para el
+agente (`Ctrl+T` de OpenCode, `Ctrl+W` de bash…).
+
+Aun así existe el `MODO RNCli`: pulsa **Ctrl derecho** (o **Escape**, si lo activas en
+Ajustes → Tecla Escape) para quitar el foco de la TUI y manejar menús, barra inferior y
+explorador con el ratón. Haz clic en cualquier terminal o pulsa la Host Key otra vez para
+volver a escribir. Si tu escritorio no reporta el Ctrl derecho, ejecuta
+`tests/key_diag.py` y compara los códigos que imprime con los de `is_right_ctrl`.
 
 ### La pantalla «New session» de OpenCode
 
