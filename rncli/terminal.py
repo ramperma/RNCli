@@ -978,6 +978,7 @@ class TerminalWidget(QWidget):
             y = int(PAD_Y + row * cell_h)
             chars = self._row_abs(base + row)
 
+            sel_from = sel_to = None
             if sel_start is not None and sel_rows[0] <= base + row <= sel_rows[1]:
                 c_from, c_to = 0, self._screen.columns - 1
                 if base + row == sel_start[0]:
@@ -988,6 +989,7 @@ class TerminalWidget(QWidget):
                     QRect(int(PAD_X + c_from * cell_w), y, (c_to - c_from + 1) * cell_w, cell_h),
                     self._selection_color,
                 )
+                sel_from, sel_to = c_from, c_to
 
             run_text: list[str] = []
             run_x = 0
@@ -998,8 +1000,13 @@ class TerminalWidget(QWidget):
                 if ch.data == "":
                     x += cell_w
                     continue
+                # Las TUI (OpenCode) pintan con fondo propio: si no marcamos la
+                # selección en el trazo, ese fondo tapa el resaltado y parece
+                # que seleccionar no funciona.
+                selected = sel_from is not None and sel_from <= col <= sel_to
                 pen = (
-                    ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough, ch.reverse,
+                    ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough,
+                    ch.reverse, selected,
                 )
                 if pen != run_pen:
                     self._flush_run(painter, run_text, run_x, y, run_pen)
@@ -1055,7 +1062,7 @@ class TerminalWidget(QWidget):
     def _flush_run(self, painter: QPainter, text: list[str], x: float, y: float, pen) -> None:
         if not text or pen is None:
             return
-        fg_value, bg_value, bold, italics, underscore, strikethrough, reverse = pen
+        fg_value, bg_value, bold, italics, underscore, strikethrough, reverse, selected = pen
         bright = None
         if bold and isinstance(fg_value, str) and fg_value in self._palette and not fg_value.startswith("bright"):
             bright = "bright" + fg_value
@@ -1071,7 +1078,11 @@ class TerminalWidget(QWidget):
         origin_x = int(x)
         origin_y = int(y)
 
-        if bg != self._bg_default or reverse:
+        if selected:
+            # El fondo del resaltado gana al color propio de la celda: sin esto,
+            # las TUI que pintan paneles con fondo (OpenCode) ocultan la selección.
+            painter.fillRect(QRect(origin_x, origin_y, len(content) * cell_w, cell_h), self._selection_color)
+        elif bg != self._bg_default or reverse:
             painter.fillRect(QRect(origin_x, origin_y, len(content) * cell_w, cell_h), bg)
 
         font = self._font

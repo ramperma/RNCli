@@ -142,6 +142,7 @@ herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas
 | **Escape** | Configurable en Ajustes: al terminal o Host Key |
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
 | Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
+| Arrastrar con el ratón | Seleccionar texto (se ve incluso sobre TUIs con colores propios); con **Copiar al seleccionar** activo en Ajustes, se copia al soltar |
 | `Ctrl+Shift+R` | Reiniciar el agente activo (`Enter` en una terminal terminada) |
 | `Ctrl+Shift+E` | Mostrar u ocultar el **Explorador** |
 | `Ctrl+Shift+H` | Mostrar u ocultar la **barra de herramientas** |

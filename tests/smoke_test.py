@@ -313,6 +313,64 @@ def main() -> int:
         check(False, "arrastrar al margen selecciona la última columna")
         check(False, "un clic no deja un cuadrado de selección")
 
+    # --- selección con el ratón sobre celdas con fondo propio (OpenCode) ------
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QMouseEvent
+
+    bg_marker = "FONDO-PROPIO-OK"
+    terminal.feed_text(f"\x1b[48;2;30;30;30m{bg_marker}\x1b[0m\r\n")
+    wait(300)
+    bg_row = bg_col = None
+    for abs_row in range(terminal._history_len() + terminal._screen.lines):
+        row_text = "".join(ch.data or " " for ch in terminal._row_abs(abs_row))
+        idx = row_text.find(bg_marker)
+        if idx >= 0:
+            bg_row, bg_col = abs_row, idx
+            break
+    check(bg_row is not None, "la línea de prueba con fondo propio está en pantalla")
+    visible_row = (bg_row or 0) - (terminal._history_len() - terminal._scroll_offset)
+    if bg_row is not None and 0 <= visible_row < terminal._screen.lines:
+        copy_was = terminal.settings.copy_on_select
+        terminal.settings.copy_on_select = True
+        QApplication.clipboard().setText("")
+
+        def mouse(kind, x, y, button, buttons):
+            pos = QPoint(int(x), int(y))
+            ev = QMouseEvent(
+                kind, pos.toPointF(), terminal.mapToGlobal(pos), button, buttons,
+                Qt.KeyboardModifier.NoModifier,
+            )
+            QApplication.sendEvent(terminal, ev)
+
+        y_mid = PAD_Y + visible_row * terminal._cell_h + terminal._cell_h / 2
+        x_from = PAD_X + bg_col * terminal._cell_w + terminal._cell_w / 2
+        x_to = x_from + (len(bg_marker) - 1) * terminal._cell_w
+        mouse(QEvent.Type.MouseButtonPress, x_from, y_mid, Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton)
+        wait(50)
+        mouse(QEvent.Type.MouseMove, x_to, y_mid, Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton)
+        wait(50)
+        mouse(QEvent.Type.MouseButtonRelease, x_to, y_mid, Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton)
+        wait(100)
+        check(
+            bg_marker in QApplication.clipboard().text(),
+            "arrastrar con el ratón selecciona y copia al soltar (aunque la app pinte fondos propios)",
+        )
+        pixel = terminal.grab().toImage().pixelColor(
+            int(PAD_X + (bg_col + 2) * terminal._cell_w), int(y_mid)
+        )
+        sel = terminal._selection_color
+        check(
+            abs(pixel.red() - sel.red()) <= 12
+            and abs(pixel.green() - sel.green()) <= 12
+            and abs(pixel.blue() - sel.blue()) <= 12,
+            "el resaltado de selección se ve sobre las celdas con fondo propio",
+        )
+        terminal.settings.copy_on_select = copy_was
+        terminal._clear_selection()
+    else:
+        check(False, "arrastrar con el ratón selecciona y copia al soltar (aunque la app pinte fondos propios)")
+        check(False, "el resaltado de selección se ve sobre las celdas con fondo propio")
+
     # --- sesión guardada ---------------------------------------------------------
     from rncli.config import load_session, save_session
 
@@ -482,12 +540,13 @@ def main() -> int:
     checked_ids = {aid for aid, cb in manager._checkboxes.items() if cb.isChecked()}
     check(checked_ids == installed_ids, "«Seleccionar instalados» marca solo los instalados en el sistema")
 
-    # Filtro de búsqueda
+    # Filtro de búsqueda (el diálogo está oculto en la prueba: isVisibleTo mide
+    # la visibilidad relativa al diálogo, no la cadena de padres ocultos).
     manager._apply_filter("Bash")
-    visible_bash = [aid for aid, card in manager._cards.items() if card.isVisible()]
+    visible_bash = [aid for aid, card in manager._cards.items() if card.isVisibleTo(manager)]
     check("shell" in visible_bash and len(visible_bash) < len(manager._cards), "el filtro oculta agentes que no coinciden")
     manager._apply_filter("")
-    check(all(card.isVisible() for card in manager._cards.values()), "limpiar el filtro vuelve a mostrar todos los agentes")
+    check(all(card.isVisibleTo(manager) for card in manager._cards.values()), "limpiar el filtro vuelve a mostrar todos los agentes")
 
     # Guardar selección y persistencia
     # Dejamos seleccionados shell y opencode (si existe)
