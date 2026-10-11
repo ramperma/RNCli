@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QScrollBar,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -40,6 +41,7 @@ class PaneWidget(QFrame):
         self.cwd = cwd or settings.start_dir or os.path.expanduser("~")
         self.session: PtySession | None = None
         self.terminal: TerminalWidget | None = None
+        self.scrollbar: QScrollBar | None = None
         self.title = agent.name
         self._grave: list[PtySession] = []
 
@@ -106,7 +108,7 @@ class PaneWidget(QFrame):
         layout.addWidget(self.close_button)
 
         self.body = QWidget(self)
-        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout = QHBoxLayout(self.body)
         self.body_layout.setContentsMargins(0, 0, 0, 0)
         self.body_layout.setSpacing(0)
 
@@ -137,7 +139,14 @@ class PaneWidget(QFrame):
         self.terminal.userFocusReceived.connect(lambda: self.userFocusRequested.emit(self))
         self.terminal.directoryDropped.connect(self._on_directory_drop)
         self.terminal.filesDropped.connect(self._on_files_drop)
-        self.body_layout.addWidget(self.terminal)
+
+        self.scrollbar = QScrollBar(Qt.Orientation.Vertical, self.body)
+        self.scrollbar.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.scrollbar.sliderPressed.connect(lambda: self.focusRequested.emit(self))
+        self.terminal.attach_scrollbar(self.scrollbar)
+
+        self.body_layout.addWidget(self.terminal, 1)
+        self.body_layout.addWidget(self.scrollbar, 0)
         self.session.exited.connect(self._on_exited)
         self._set_status("")
         self._refresh_header()
@@ -145,8 +154,12 @@ class PaneWidget(QFrame):
         self.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _teardown(self) -> None:
-        old_session, old_terminal = self.session, self.terminal
-        self.session, self.terminal = None, None
+        old_session, old_terminal, old_scrollbar = (
+            self.session,
+            self.terminal,
+            self.scrollbar,
+        )
+        self.session, self.terminal, self.scrollbar = None, None, None
         if old_terminal is not None:
             try:
                 old_session.dataReceived.disconnect(old_terminal._feed)
@@ -154,6 +167,9 @@ class PaneWidget(QFrame):
                 pass
             old_terminal.setParent(None)
             old_terminal.deleteLater()
+        if old_scrollbar is not None:
+            old_scrollbar.setParent(None)
+            old_scrollbar.deleteLater()
         if old_session is not None:
             try:
                 old_session.exited.disconnect(self._on_exited)

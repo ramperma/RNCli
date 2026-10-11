@@ -538,6 +538,12 @@ def app_stylesheet(name: str) -> str:
     QScrollBar::handle:vertical:hover {{
         background: {muted};
     }}
+    QScrollBar::handle:vertical:pressed {{
+        background: {pal['accent']};
+    }}
+    QScrollBar:vertical:disabled, QScrollBar::handle:vertical:disabled {{
+        background: transparent;
+    }}
     QScrollBar:horizontal {{
         background: {pal['bg']};
         height: 11px;
@@ -591,5 +597,24 @@ def app_stylesheet(name: str) -> str:
         border: 1px solid {pal['border']};
         border-radius: 8px;
         background: {pal['bg']};
+    }}
+
+    QFrame#AgentCard {{
+        background: {surface};
+        border: 1px solid {pal['border']};
+        border-radius: 8px;
+        padding: 6px 10px;
+    }}
+    QFrame#AgentCard:hover {{
+        border-color: {pal['accent']};
+    }}
+    QLabel#AgentBadgeInstalled {{
+        color: {pal['green']};
+        font-size: 11px;
+        font-weight: 600;
+    }}
+    QLabel#AgentBadgeMissing {{
+        color: {muted};
+        font-size: 11px;
     }}
     """

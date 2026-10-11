@@ -170,6 +170,10 @@ class FileBrowserWidget(QWidget):
     def show_hidden(self) -> bool:
         return self._show_hidden
 
+    @property
+    def current_dir(self) -> str:
+        return self._current_dir
+
     # ------------------------------------------------------------------ navegación
     def set_root(self, path: str) -> None:
         path = os.path.realpath(os.path.expanduser(path or "~"))

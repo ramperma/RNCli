@@ -31,7 +31,7 @@ class Settings:
     scrollback: int = 5000
     default_layout: str = "1"
     default_agent: str = ""            # vacío = autodetectado
-    restore_session: bool = False
+    restore_session: bool = True
     confirm_exit: bool = True
     cursor_blink: bool = True
     copy_on_select: bool = False
@@ -39,6 +39,7 @@ class Settings:
     start_dir: str = str(Path.home())
     escape_key: str = "terminal"       # terminal | host
     show_hidden_files: bool = False
+    show_toolbar: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -118,13 +119,19 @@ class Config:
         return find_agent(self.agents, agent_id)
 
 
-def save_session(tabs: list[dict], geometry: str | None = None) -> None:
+def save_session(
+    tabs: list[dict],
+    geometry: str | None = None,
+    extra: dict | None = None,
+) -> None:
     """Guarda la disposición actual (pestañas, paneles, agentes, geometría)."""
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         payload: dict = {"tabs": tabs}
         if geometry:
             payload["geometry"] = geometry
+        if extra:
+            payload.update(extra)
         SESSION_PATH.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
@@ -133,7 +140,7 @@ def save_session(tabs: list[dict], geometry: str | None = None) -> None:
 
 
 def load_session() -> dict:
-    """Devuelve {'tabs': [...], 'geometry': '...'} (vacío si no hay sesión)."""
+    """Devuelve la sesión guardada (vacío si no hay)."""
     try:
         data = json.loads(SESSION_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -143,4 +150,5 @@ def load_session() -> dict:
     tabs = data.get("tabs")
     if not isinstance(tabs, list):
         tabs = []
-    return {"tabs": tabs, "geometry": data.get("geometry")}
+    data["tabs"] = tabs
+    return data

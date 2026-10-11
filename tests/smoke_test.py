@@ -70,7 +70,7 @@ def main() -> int:
     config.settings.restore_session = False
     config.settings.start_dir = "/tmp"
 
-    window = MainWindow(config)
+    window = MainWindow(config, restore=False)
     window.resize(1200, 760)
     window.show()
     wait(300)
@@ -153,7 +153,10 @@ def main() -> int:
             id=f"{agent_id}-version", name=agent.name, command=[*agent.command, "--version"]
         )
         probe_pane = workspace.add_pane(probe, "/tmp")
-        wait(3000)
+        for _ in range(25):
+            wait(500)
+            if probe_pane.session.returncode is not None:
+                break
         output = screen_text(probe_pane.terminal)
         version = re.search(r"\d+\.\d+\.\d+", output)
         check(
@@ -180,8 +183,12 @@ def main() -> int:
     wait(1600)
     terminal = active.terminal
     check(terminal.history_len() > 20, f"el historial guarda líneas ({terminal.history_len()})")
+    check(active.scrollbar is not None and active.scrollbar.isEnabled(), "el panel tiene una barra de scroll activa")
     terminal.scroll_by(20)
     check(terminal._scroll_offset == 20, "la rueda/atajo desplaza el historial")
+    check(active.scrollbar.value() == terminal.history_len() - 20, "la barra de scroll se sincroniza con el historial")
+    active.scrollbar.setValue(terminal.history_len() - 15)
+    check(terminal._scroll_offset == 15, "arrastrar la barra de scroll desplaza el historial")
     check("LINEA-" in visible_text(terminal), "se pueden leer líneas antiguas del historial")
     terminal.scroll_to_bottom()
     check(terminal._scroll_offset == 0, "volver abajo restaura la vista en vivo")
@@ -400,12 +407,82 @@ def main() -> int:
     ssh_dialog.deleteLater()
 
     # --- diálogos ----------------------------------------------------------------
-    from rncli.dialogs import AgentChooserDialog, SettingsDialog, ShortcutsDialog, SudoDialog
+    from rncli.agents import KNOWN_AGENTS, catalog_agents
+    from rncli.dialogs import (
+        AddAgentDialog,
+        AgentChooserDialog,
+        AgentManagerDialog,
+        SettingsDialog,
+        ShortcutsDialog,
+        SudoDialog,
+    )
 
-    chooser = AgentChooserDialog(config.agents, config.settings, window)
+    # Catálogo extendido de agentes
+    catalog = catalog_agents(config.agents)
+    check(len(catalog) >= len(KNOWN_AGENTS), "el catálogo contiene los agentes conocidos")
+    check(any(a.id == "aider" for a in catalog), "el catálogo incluye aider")
+    check(any(a.id == "antigravity" for a in catalog), "el catálogo incluye antigravity")
+    check(any(a.id == "goose" for a in catalog), "el catálogo incluye goose")
+
+    # Diálogo de añadir agente
+    add_agent_dialog = AddAgentDialog(window)
+    add_agent_dialog.name_edit.setText("Mi Agente Custom")
+    add_agent_dialog.cmd_edit.setText("echo custom-agent")
+    add_agent_dialog.desc_edit.setText("Agente de prueba")
+    add_agent_dialog._accept()
+    custom_created = add_agent_dialog.created_agent()
+    check(
+        custom_created is not None
+        and custom_created.id == "mi-agente-custom"
+        and custom_created.command == ["echo", "custom-agent"],
+        "el diálogo de añadir agente crea un nuevo agente",
+    )
+    add_agent_dialog.deleteLater()
+
+    # Asistente y gestor de agentes
+    manager = AgentManagerDialog(config, window)
+    check(len(manager._all_agents) == len(catalog), "el gestor carga todos los agentes del catálogo")
+    check(all(a.id in manager._checkboxes for a in manager._all_agents), "cada agente tiene su casilla de selección")
+
+    # Selección masiva e instalados
+    manager._select_none()
+    check(all(not cb.isChecked() for cb in manager._checkboxes.values()), "el botón «Ninguno» desmarca todos los agentes")
+
+    manager._select_all()
+    check(all(cb.isChecked() for cb in manager._checkboxes.values()), "el botón «Todos» marca todos los agentes")
+
+    manager._select_installed()
+    installed_ids = {a.id for a in manager._all_agents if a.available()}
+    checked_ids = {aid for aid, cb in manager._checkboxes.items() if cb.isChecked()}
+    check(checked_ids == installed_ids, "«Seleccionar instalados» marca solo los instalados en el sistema")
+
+    # Filtro de búsqueda
+    manager._apply_filter("Bash")
+    visible_bash = [aid for aid, card in manager._cards.items() if card.isVisible()]
+    check("shell" in visible_bash and len(visible_bash) < len(manager._cards), "el filtro oculta agentes que no coinciden")
+    manager._apply_filter("")
+    check(all(card.isVisible() for card in manager._cards.values()), "limpiar el filtro vuelve a mostrar todos los agentes")
+
+    # Guardar selección y persistencia
+    # Dejamos seleccionados shell y opencode (si existe)
+    manager._select_none()
+    manager._checkboxes["shell"].setChecked(True)
+    manager._save_and_apply()
+    check(len(config.agents) == 1 and config.agents[0].id == "shell", "guardar aplica los agentes seleccionados al config")
+
+    # Comprobación de que desaparecen los deseleccionados y aparecen los seleccionados
+    chooser = AgentChooserDialog(config.agents, config.settings, window, config=config)
     check(chooser.chosen_agent() is not None, "el selector de agentes lista los agentes")
+    check(chooser._grid.count() == 1, "el selector muestra solo el agente seleccionado")
     chooser._choose_ssh()
     check(chooser.wants_ssh(), "el selector de agentes ofrece la conexión SSH")
+
+    # Añadir otro agente a config y recargar la rejilla
+    shell_agent = config.agents[0]
+    config.agents = [shell_agent, Agent(id="test-agent", name="Test", command=["echo", "test"], emoji="🧪")]
+    chooser._agents = list(config.agents)
+    chooser._reload_grid()
+    check(chooser._grid.count() == 2, "al actualizar agentes, los nuevos aparecen y los deseleccionados desaparecen")
     chooser.deleteLater()
     sudo = SudoDialog(window)
     snippets_ok = True
@@ -447,6 +524,9 @@ def main() -> int:
     settings_ui.hidden_check.setChecked(True)
     escaped = settings_ui.result_settings(config.settings)
     check(escaped.show_hidden_files is True, "ajustes guarda mostrar archivos ocultos")
+    settings_ui.toolbar_check.setChecked(False)
+    escaped = settings_ui.result_settings(config.settings)
+    check(escaped.show_toolbar is False, "ajustes guarda ocultar la barra de herramientas")
     settings_ui.deleteLater()
 
     from rncli.config import Settings as SettingsCls
@@ -465,6 +545,18 @@ def main() -> int:
         "config.json recuerda mostrar archivos ocultos",
     )
     check(
+        SettingsCls.from_dict({}).show_toolbar is True,
+        "la barra de herramientas viene visible por defecto",
+    )
+    check(
+        SettingsCls.from_dict({"show_toolbar": False}).show_toolbar is False,
+        "config.json recuerda ocultar la barra de herramientas",
+    )
+    check(
+        SettingsCls.from_dict({}).restore_session is True,
+        "recordar la sesión viene activado por defecto",
+    )
+    check(
         SettingsCls.from_dict({"theme": "modern_dark"}).theme == "modern_dark",
         "config.json acepta el tema modern_dark",
     )
@@ -473,6 +565,44 @@ def main() -> int:
         hasattr(window, "layout_buttons")
         and list(window.layout_buttons) == ["1", "2v", "2h", "4", "6", "all"],
         "la barra muestra el selector de diseño",
+    )
+    check(window.toolbar.isVisible() and window.settings.show_toolbar, "la barra de herramientas arranca visible")
+    window.toolbar.setVisible(False)
+    check(
+        not window.toolbar.isVisible()
+        and not window.settings.show_toolbar
+        and not window.act_toolbar.isChecked(),
+        "se puede ocultar la barra de herramientas",
+    )
+    window.act_toolbar.trigger()
+    check(
+        window.toolbar.isVisible() and window.settings.show_toolbar and window.act_toolbar.isChecked(),
+        "Ver → Barra de herramientas la vuelve a mostrar",
+    )
+    from PySide6.QtWidgets import QToolButton
+
+    hide_buttons = [
+        button
+        for button in window.toolbar.findChildren(QToolButton)
+        if button.text() == "Ocultar"
+    ]
+    check(len(hide_buttons) == 1, "la barra tiene un botón Ocultar")
+    hide_buttons[0].click()
+    check(
+        not window.toolbar.isVisible() and not window.settings.show_toolbar,
+        "el botón Ocultar esconde la barra de herramientas",
+    )
+    window.act_toolbar.trigger()
+    window._persist_session()
+    persisted = load_session()
+    check(
+        bool(persisted.get("tabs")),
+        "al cerrar se guarda la sesión aunque restore_session esté desactivado",
+    )
+    check(
+        isinstance(persisted.get("file_browser"), dict)
+        and bool(persisted["file_browser"].get("path")),
+        "la sesión guarda la carpeta del explorador",
     )
     from rncli.theme import THEME_LABELS, app_stylesheet
 
@@ -541,6 +671,29 @@ def main() -> int:
         check(
             bool(host_hits) and not any(chunk == b"\x1b" for chunk in recorded),
             "Escape como Host Key no se envía al agente",
+        )
+        recorded.clear()
+        # Acentos: tecla muerta aguda + vocal 'a' -> 'á'
+        target.terminal.keyPressEvent(
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Dead_Acute, Qt.KeyboardModifier.NoModifier, "")
+        )
+        target.terminal.keyPressEvent(
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier, "a")
+        )
+        check(
+            b"\xc3\xa1" in b"".join(recorded),
+            "las teclas muertas componen vocales acentuadas (á)",
+        )
+        recorded.clear()
+        # InputMethodEvent (IBus / Wayland IME)
+        from PySide6.QtGui import QInputMethodEvent
+
+        ime_ev = QInputMethodEvent()
+        ime_ev.setCommitString("canción")
+        target.terminal.inputMethodEvent(ime_ev)
+        check(
+            "canción".encode("utf-8") in b"".join(recorded),
+            "inputMethodEvent reconoce caracteres acentuados desde el método de entrada",
         )
         target.session.write = real_write  # type: ignore[method-assign]
     else:

@@ -453,7 +453,7 @@ class WorkspaceWidget(QWidget):
             "panes": [
                 {
                     "agent": pane.agent.id,
-                    "cwd": pane.cwd,
+                    "cwd": pane.shell_cwd() or pane.cwd,
                     "name": pane.agent.name,
                     "command": list(pane.agent.command),
                     "emoji": pane.agent.emoji,

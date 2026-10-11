@@ -18,13 +18,16 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFontComboBox,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QTextBrowser,
@@ -34,9 +37,10 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__
-from .agents import Agent
-from .config import ESCAPE_KEY_LABELS, ESCAPE_KEY_MODES, LAYOUTS, Settings
+from .agents import Agent, KNOWN_AGENTS, catalog_agents, pick_default_agent
+from .config import ESCAPE_KEY_LABELS, ESCAPE_KEY_MODES, LAYOUTS, Config, Settings
 from .layouts import LAYOUT_LABELS
+from .shell_env import reset_cache, resolve_executable
 from .ssh_hosts import SshHost
 from .theme import THEME_LABELS
 
@@ -44,50 +48,448 @@ MD_GUIDE = Path(__file__).resolve().parents[1] / "sudo-config-strategies.md"
 
 
 # --------------------------------------------------------------------------- agentes
+class AddAgentDialog(QDialog):
+    """Diálogo para configurar y añadir un agente o comando CLI personalizado."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} · nuevo agente")
+        self.setMinimumWidth(460)
+        self._created_agent: Agent | None = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(12)
+
+        title = QLabel("Añadir nuevo agente o herramienta CLI")
+        title.setStyleSheet("font-size: 15px; font-weight: 600;")
+        root.addWidget(title)
+
+        hint = QLabel(
+            "Indica el comando y los detalles del agente. "
+            "Se comprobará en tu PATH si el ejecutable está disponible."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(10)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("p. ej. Goose, Open Interpreter, Bash")
+        form.addRow("Nombre *", self.name_edit)
+
+        self.id_edit = QLineEdit()
+        self.id_edit.setPlaceholderText("identificador único (ej. mi-agente, se autogenera si se omite)")
+        form.addRow("Identificador", self.id_edit)
+
+        self.cmd_edit = QLineEdit()
+        self.cmd_edit.setPlaceholderText("comando a ejecutar, p. ej. goose o /usr/local/bin/aider")
+        form.addRow("Comando *", self.cmd_edit)
+
+        emoji_color_row = QHBoxLayout()
+        self.emoji_edit = QLineEdit("🤖")
+        self.emoji_edit.setFixedWidth(50)
+        self.color_edit = QLineEdit("#818cf8")
+        self.color_edit.setFixedWidth(90)
+        emoji_color_row.addWidget(QLabel("Emoji:"))
+        emoji_color_row.addWidget(self.emoji_edit)
+        emoji_color_row.addSpacing(14)
+        emoji_color_row.addWidget(QLabel("Color:"))
+        emoji_color_row.addWidget(self.color_edit)
+        emoji_color_row.addStretch(1)
+        emoji_color_box = QWidget()
+        emoji_color_box.setLayout(emoji_color_row)
+        form.addRow("Apariencia", emoji_color_box)
+
+        self.desc_edit = QLineEdit()
+        self.desc_edit.setPlaceholderText("descripción breve para el selector (opcional)")
+        form.addRow("Descripción", self.desc_edit)
+
+        root.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _accept(self) -> None:
+        name = self.name_edit.text().strip()
+        cmd_text = self.cmd_edit.text().strip()
+        if not name or not cmd_text:
+            QMessageBox.warning(
+                self,
+                "Campos obligatorios",
+                "Debes introducir obligatoriamente un nombre y un comando.",
+            )
+            return
+
+        command = shlex.split(cmd_text)
+        if not command:
+            QMessageBox.warning(self, "Comando no válido", "Introduce un comando válido.")
+            return
+
+        raw_id = self.id_edit.text().strip()
+        if not raw_id:
+            import re
+
+            raw_id = re.sub(r"[^a-zA-Z0-9_\-]+", "-", name.lower()).strip("-") or command[0]
+
+        self._created_agent = Agent(
+            id=raw_id,
+            name=name,
+            command=command,
+            emoji=self.emoji_edit.text().strip() or "🤖",
+            color=self.color_edit.text().strip() or "#818cf8",
+            description=self.desc_edit.text().strip(),
+        )
+        self.accept()
+
+    def created_agent(self) -> Agent | None:
+        return self._created_agent
+
+
+class AgentManagerDialog(QDialog):
+    """Asistente para escanear, seleccionar y activar agentes de IA y shells."""
+
+    def __init__(self, config: Config, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} · asistente de agentes")
+        self.resize(740, 680)
+        self.config = config
+        self._all_agents: list[Agent] = catalog_agents(config.agents)
+        self._active_ids: set[str] = {a.id for a in config.agents}
+
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._cards: dict[str, QFrame] = {}
+        self._badge_labels: dict[str, QLabel] = {}
+        self._cmd_labels: dict[str, QLabel] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(12)
+
+        title = QLabel("Asistente y gestor de agentes")
+        title.setStyleSheet("font-size: 17px; font-weight: 600;")
+        root.addWidget(title)
+
+        subtitle = QLabel(
+            "Escanea tu equipo para detectar qué agentes de IA y shells están instalados en tu PATH. "
+            "Marca los agentes que quieres ver activos en RNCli; los desmarcados desaparecerán "
+            "automáticamente del selector."
+        )
+        subtitle.setWordWrap(True)
+        subtitle.setObjectName("Hint")
+        root.addWidget(subtitle)
+
+        # Barra de acciones
+        toolbar = QHBoxLayout()
+        toolbar.setSpacing(8)
+
+        self.btn_rescan = QPushButton("🔄 Volver a escanear")
+        self.btn_rescan.setToolTip("Limpiar caché de ejecutables y volver a buscar en PATH.")
+        self.btn_rescan.clicked.connect(self._rescan)
+        toolbar.addWidget(self.btn_rescan)
+
+        self.btn_select_installed = QPushButton("⚡ Seleccionar instalados")
+        self.btn_select_installed.setToolTip("Marcar únicamente los agentes detectados en el sistema.")
+        self.btn_select_installed.clicked.connect(self._select_installed)
+        toolbar.addWidget(self.btn_select_installed)
+
+        self.btn_all = QPushButton("✔ Todos")
+        self.btn_all.clicked.connect(self._select_all)
+        toolbar.addWidget(self.btn_all)
+
+        self.btn_none = QPushButton("✖ Ninguno")
+        self.btn_none.clicked.connect(self._select_none)
+        toolbar.addWidget(self.btn_none)
+
+        self.btn_add = QPushButton("➕ Añadir agente…")
+        self.btn_add.setToolTip("Configurar un agente o CLI propio.")
+        self.btn_add.clicked.connect(self._add_custom_agent)
+        toolbar.addWidget(self.btn_add)
+
+        toolbar.addStretch(1)
+        root.addLayout(toolbar)
+
+        # Filtro de búsqueda
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("🔍 Filtrar por nombre, comando o estado…")
+        self.search_edit.textChanged.connect(self._apply_filter)
+        root.addWidget(self.search_edit)
+
+        # Scroll área con tarjetas de agentes
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+
+        self.cards_container = QWidget()
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(0, 4, 0, 4)
+        self.cards_layout.setSpacing(8)
+
+        self.scroll_area.setWidget(self.cards_container)
+        root.addWidget(self.scroll_area, 1)
+
+        for agent in self._all_agents:
+            self.cards_layout.addWidget(self._create_agent_card(agent))
+
+        self.cards_layout.addStretch(1)
+
+        # Estado y resumen
+        self.status_label = QLabel()
+        self.status_label.setObjectName("Hint")
+        root.addWidget(self.status_label)
+        self._rescan()
+
+        # Botones de pie
+        buttons_box = QHBoxLayout()
+        buttons_box.addStretch(1)
+
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+        buttons_box.addWidget(btn_cancel)
+
+        btn_save = QPushButton("Guardar y aplicar")
+        btn_save.setDefault(True)
+        btn_save.setStyleSheet("font-weight: 600;")
+        btn_save.clicked.connect(self._save_and_apply)
+        buttons_box.addWidget(btn_save)
+
+        root.addLayout(buttons_box)
+
+    def _create_agent_card(self, agent: Agent) -> QFrame:
+        card = QFrame()
+        card.setObjectName("AgentCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
+
+        top_row = QHBoxLayout()
+        cb = QCheckBox(f"{agent.emoji}  {agent.name}")
+        cb.setStyleSheet("font-size: 13px; font-weight: 600;")
+        cb.setChecked(agent.id in self._active_ids)
+        cb.toggled.connect(lambda _checked: self._update_summary())
+        self._checkboxes[agent.id] = cb
+        top_row.addWidget(cb, 1)
+
+        badge = QLabel()
+        self._badge_labels[agent.id] = badge
+        top_row.addWidget(badge)
+
+        known_ids = {a.id for a in KNOWN_AGENTS}
+        if agent.id not in known_ids:
+            del_btn = QPushButton("🗑")
+            del_btn.setFixedSize(28, 26)
+            del_btn.setToolTip("Eliminar agente personalizado")
+            del_btn.clicked.connect(lambda _=False, a=agent: self._remove_custom_agent(a))
+            top_row.addWidget(del_btn)
+
+        layout.addLayout(top_row)
+
+        info_row = QHBoxLayout()
+        cmd_text = " ".join(agent.command)
+        cmd_lbl = QLabel(f"Comando: {cmd_text}")
+        cmd_lbl.setStyleSheet("font-family: monospace; font-size: 11px;")
+        cmd_lbl.setObjectName("Hint")
+        self._cmd_labels[agent.id] = cmd_lbl
+        info_row.addWidget(cmd_lbl)
+
+        if agent.description:
+            info_row.addSpacing(16)
+            desc_lbl = QLabel(agent.description)
+            desc_lbl.setObjectName("Hint")
+            desc_lbl.setStyleSheet("font-size: 11px;")
+            info_row.addWidget(desc_lbl, 1)
+        else:
+            info_row.addStretch(1)
+
+        layout.addLayout(info_row)
+        self._cards[agent.id] = card
+        return card
+
+    def _update_badge(self, agent: Agent) -> None:
+        badge = self._badge_labels.get(agent.id)
+        if badge is None:
+            return
+        path = resolve_executable(agent.executable)
+        if path:
+            badge.setObjectName("AgentBadgeInstalled")
+            badge.setText(f"● Instalado ({path})")
+            badge.setToolTip(f"Ejecutable disponible en {path}")
+        else:
+            badge.setObjectName("AgentBadgeMissing")
+            badge.setText("○ No instalado en PATH")
+            badge.setToolTip(f"No se encontró «{agent.executable}» en el PATH del sistema.")
+        badge.style().unpolish(badge)
+        badge.style().polish(badge)
+
+    def _rescan(self) -> None:
+        reset_cache()
+        for agent in self._all_agents:
+            self._update_badge(agent)
+        self._update_summary()
+
+    def _select_installed(self) -> None:
+        reset_cache()
+        for agent in self._all_agents:
+            is_installed = bool(resolve_executable(agent.executable))
+            cb = self._checkboxes.get(agent.id)
+            if cb is not None:
+                cb.setChecked(is_installed)
+            self._update_badge(agent)
+        self._update_summary()
+
+    def _select_all(self) -> None:
+        for cb in self._checkboxes.values():
+            cb.setChecked(True)
+        self._update_summary()
+
+    def _select_none(self) -> None:
+        for cb in self._checkboxes.values():
+            cb.setChecked(False)
+        self._update_summary()
+
+    def _apply_filter(self, query: str) -> None:
+        q = query.strip().lower()
+        for agent in self._all_agents:
+            card = self._cards.get(agent.id)
+            if card is None:
+                continue
+            if not q:
+                card.setVisible(True)
+                continue
+            is_installed = bool(resolve_executable(agent.executable))
+            status_text = "instalado" if is_installed else "no instalado"
+            match = (
+                q in agent.name.lower()
+                or q in agent.id.lower()
+                or q in " ".join(agent.command).lower()
+                or q in agent.description.lower()
+                or q in status_text
+            )
+            card.setVisible(match)
+
+    def _add_custom_agent(self) -> None:
+        dialog = AddAgentDialog(self)
+        if dialog.exec() != AddAgentDialog.DialogCode.Accepted:
+            return
+        agent = dialog.created_agent()
+        if agent is None:
+            return
+        existing = next((a for a in self._all_agents if a.id == agent.id), None)
+        if existing is not None:
+            QMessageBox.information(
+                self,
+                "Agente existente",
+                f"Ya existe un agente con el identificador «{agent.id}».",
+            )
+            return
+        self._all_agents.append(agent)
+        self._active_ids.add(agent.id)
+        card = self._create_agent_card(agent)
+        self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+        self._update_badge(agent)
+        self._update_summary()
+        self.scroll_area.ensureWidgetVisible(card)
+
+    def _remove_custom_agent(self, agent: Agent) -> None:
+        card = self._cards.pop(agent.id, None)
+        if card is not None:
+            card.deleteLater()
+        self._checkboxes.pop(agent.id, None)
+        self._badge_labels.pop(agent.id, None)
+        self._cmd_labels.pop(agent.id, None)
+        self._all_agents = [a for a in self._all_agents if a.id != agent.id]
+        self._active_ids.discard(agent.id)
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        selected_count = sum(1 for cb in self._checkboxes.values() if cb.isChecked())
+        installed_count = sum(1 for a in self._all_agents if resolve_executable(a.executable))
+        total = len(self._all_agents)
+        self.status_label.setText(
+            f"Seleccionados: {selected_count} de {total} agentes  ·  "
+            f"{installed_count} detectados en el sistema"
+        )
+
+    def _save_and_apply(self) -> None:
+        selected_agents: list[Agent] = [
+            agent
+            for agent in self._all_agents
+            if self._checkboxes.get(agent.id) and self._checkboxes[agent.id].isChecked()
+        ]
+        if not selected_agents:
+            QMessageBox.warning(
+                self,
+                "Sin agentes seleccionados",
+                "Debes seleccionar al menos un agente para poder usar RNCli.",
+            )
+            return
+
+        self.config.agents = selected_agents
+        selected_ids = {a.id for a in selected_agents}
+        if (
+            self.config.settings.default_agent
+            and self.config.settings.default_agent not in selected_ids
+        ):
+            self.config.settings.default_agent = ""
+
+        self.config.save()
+        self.accept()
+
+
 class AgentChooserDialog(QDialog):
     """Elige qué agente lanzar, en qué carpeta y si en pestaña nueva."""
 
-    def __init__(self, agents: list[Agent], settings: Settings, parent=None, cwd_hint: str = "") -> None:
+    def __init__(
+        self,
+        agents: list[Agent],
+        settings: Settings,
+        parent=None,
+        cwd_hint: str = "",
+        config: Config | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · nuevo panel")
-        self.setMinimumWidth(600)
-        self._agents = agents
+        self.setMinimumWidth(620)
+        self._agents = list(agents)
+        self._settings = settings
+        self._config = config
         self._selected: Agent | None = None
         self._ssh = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 16)
         root.setSpacing(12)
+
+        header_row = QHBoxLayout()
+        header_text = QVBoxLayout()
         title = QLabel("¿Qué agente quieres lanzar?")
         title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        root.addWidget(title)
+        header_text.addWidget(title)
         hint = QLabel("Pulsa el número del agente o haz clic. Esc para cancelar.")
         hint.setObjectName("Hint")
-        root.addWidget(hint)
+        header_text.addWidget(hint)
+        header_row.addLayout(header_text, 1)
 
-        grid = QGridLayout()
-        grid.setSpacing(10)
-        grid.setVerticalSpacing(10)
-        for index, agent in enumerate(agents):
-            button = QToolButton()
-            button.setObjectName("AgentButton")
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            button.setText(f"{index + 1}. {agent.emoji}  {agent.name}\n{self._subtitle(agent)}")
-            if agent.available():
-                button.setToolTip(agent.description or " ".join(agent.command))
-            else:
-                button.setToolTip(
-                    f"No se encontró «{agent.executable}» en tu PATH.\n"
-                    "Si lo tienes instalado, abre ⚙ → «Abrir config.json» y pon la ruta "
-                    "absoluta en el campo \"command\"."
-                )
-            button.setMinimumHeight(64)
-            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            button.clicked.connect(lambda _=False, a=agent: self._choose(a))
-            if not agent.available():
-                button.setProperty("missing", True)
-            grid.addWidget(button, index // 3, index % 3)
-        root.addLayout(grid)
+        self.manage_button = QPushButton("⚙ Asistente de agentes…")
+        self.manage_button.setToolTip(
+            "Escanear el sistema en busca de agentes instalados, seleccionar y activar cuáles mostrar."
+        )
+        self.manage_button.clicked.connect(self._open_manager)
+        header_row.addWidget(self.manage_button, 0, Qt.AlignmentFlag.AlignTop)
+        root.addLayout(header_row)
+
+        self._grid = QGridLayout()
+        self._grid.setSpacing(10)
+        self._grid.setVerticalSpacing(10)
+        root.addLayout(self._grid)
+        self._reload_grid()
 
         self.ssh_button = QToolButton()
         self.ssh_button.setObjectName("AgentButton")
@@ -128,12 +530,51 @@ class AgentChooserDialog(QDialog):
         note.setObjectName("Hint")
         root.addWidget(note)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
         buttons.accepted.connect(self._accept_custom)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
         self.custom_edit.returnPressed.connect(self._accept_custom)
+
+    def _reload_grid(self) -> None:
+        while self._grid.count():
+            item = self._grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, agent in enumerate(self._agents):
+            button = QToolButton()
+            button.setObjectName("AgentButton")
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            prefix = f"{index + 1}. " if index < 9 else ""
+            button.setText(f"{prefix}{agent.emoji}  {agent.name}\n{self._subtitle(agent)}")
+            if agent.available():
+                button.setToolTip(agent.description or " ".join(agent.command))
+            else:
+                button.setToolTip(
+                    f"No se encontró «{agent.executable}» en tu PATH.\n"
+                    "Si lo tienes instalado, abre ⚙ → «Abrir config.json» y pon la ruta "
+                    "absoluta en el campo \"command\"."
+                )
+            button.setMinimumHeight(64)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _=False, a=agent: self._choose(a))
+            if not agent.available():
+                button.setProperty("missing", True)
+            self._grid.addWidget(button, index // 3, index % 3)
+
+    def _open_manager(self) -> None:
+        cfg = self._config
+        if cfg is None:
+            cfg = Config.load()
+        dialog = AgentManagerDialog(cfg, self)
+        if dialog.exec() == AgentManagerDialog.DialogCode.Accepted:
+            self._config = cfg
+            self._agents = list(cfg.agents)
+            self._reload_grid()
 
     @staticmethod
     def _subtitle(agent: Agent) -> str:
@@ -395,11 +836,19 @@ class SshDialog(QDialog):
 
 # --------------------------------------------------------------------------- ajustes
 class SettingsDialog(QDialog):
-    def __init__(self, settings: Settings, agents: list[Agent], parent=None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        agents: list[Agent],
+        parent=None,
+        config: Config | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · ajustes")
         self.setMinimumWidth(520)
-        self._agents = agents
+        self._settings = settings
+        self._agents = list(agents)
+        self._config = config
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 16)
@@ -433,10 +882,18 @@ class SettingsDialog(QDialog):
         self.layout_combo.setCurrentIndex(max(0, self.layout_combo.findData(settings.default_layout)))
 
         self.agent_combo = QComboBox()
-        self.agent_combo.addItem("Automático (primer agente instalado)", "")
-        for agent in agents:
-            self.agent_combo.addItem(f"{agent.emoji} {agent.name}", agent.id)
-        self.agent_combo.setCurrentIndex(max(0, self.agent_combo.findData(settings.default_agent)))
+        self._reload_agent_combo(settings.default_agent)
+
+        agent_row = QHBoxLayout()
+        agent_row.addWidget(self.agent_combo, 1)
+        self.manage_agents_btn = QPushButton("Asistente…")
+        self.manage_agents_btn.setToolTip(
+            "Abrir el asistente de agentes para escanear y seleccionar agentes."
+        )
+        self.manage_agents_btn.clicked.connect(self._open_agent_manager)
+        agent_row.addWidget(self.manage_agents_btn)
+        agent_box = QWidget()
+        agent_box.setLayout(agent_row)
 
         self.start_dir_edit = QLineEdit(settings.start_dir)
         browse = QPushButton("…")
@@ -453,7 +910,7 @@ class SettingsDialog(QDialog):
         form.addRow("Tema", self.theme_combo)
         form.addRow("Líneas de historial", self.scroll_spin)
         form.addRow("Diseño al abrir", self.layout_combo)
-        form.addRow("Agente por defecto", self.agent_combo)
+        form.addRow("Agente por defecto", agent_box)
         form.addRow("Carpeta inicial", dir_box)
 
         self.escape_combo = QComboBox()
@@ -482,12 +939,18 @@ class SettingsDialog(QDialog):
         self.hidden_check.setToolTip(
             "Archivos y carpetas que empiezan por «.». También se cambia con .* o Ctrl+H en el explorador."
         )
+        self.toolbar_check = QCheckBox("Mostrar la barra de herramientas")
+        self.toolbar_check.setChecked(settings.show_toolbar)
+        self.toolbar_check.setToolTip(
+            "En pantallas pequeñas puedes ocultarla desde Ver → Barra de herramientas."
+        )
         for widget in (
             self.restore_check,
             self.confirm_check,
             self.blink_check,
             self.copy_check,
             self.hidden_check,
+            self.toolbar_check,
         ):
             box_layout.addWidget(widget)
         root.addWidget(box)
@@ -498,6 +961,29 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    def _reload_agent_combo(self, selected_id: str | None = None) -> None:
+        current_data = (
+            selected_id
+            if selected_id is not None
+            else (self.agent_combo.currentData() if self.agent_combo.count() else "")
+        )
+        self.agent_combo.clear()
+        self.agent_combo.addItem("Automático (primer agente instalado)", "")
+        for agent in self._agents:
+            self.agent_combo.addItem(f"{agent.emoji} {agent.name}", agent.id)
+        idx = self.agent_combo.findData(current_data)
+        self.agent_combo.setCurrentIndex(max(0, idx))
+
+    def _open_agent_manager(self) -> None:
+        cfg = self._config
+        if cfg is None:
+            cfg = Config.load()
+        dialog = AgentManagerDialog(cfg, self)
+        if dialog.exec() == AgentManagerDialog.DialogCode.Accepted:
+            self._config = cfg
+            self._agents = list(cfg.agents)
+            self._reload_agent_combo()
 
     def _browse(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Carpeta inicial", self.start_dir_edit.text())
@@ -520,6 +1006,7 @@ class SettingsDialog(QDialog):
             start_dir=self.start_dir_edit.text().strip() or os.path.expanduser("~"),
             escape_key=str(self.escape_combo.currentData() or "terminal"),
             show_hidden_files=self.hidden_check.isChecked(),
+            show_toolbar=self.toolbar_check.isChecked(),
         )
 
 
@@ -554,6 +1041,7 @@ class ShortcutsDialog(QDialog):
         ("Ctrl+Shift+R", "Reiniciar el agente activo"),
         ("Explorador", "Archivos y carpetas: arrastra un archivo a un terminal o usa «Pegar archivo»"),
         ("··· en la barra", "Unir pestañas, reiniciar, sudo y ayuda"),
+        ("Ocultar en la barra / Ver → Barra de herramientas", "Ocultar o mostrar la barra superior (más espacio en portátiles)"),
         ("Ctrl+H", "En el explorador: mostrar u ocultar archivos ocultos"),
         ("Ctrl++ / Ctrl+- / Ctrl+0", "Tamaño de letra"),
         ("F11", "Pantalla completa"),

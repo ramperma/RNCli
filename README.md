@@ -106,7 +106,8 @@ todos (sin necesidad de activar la difusión).
 ### Explorador
 
 El panel **Explorador** aparece a la izquierda y se puede arrastrar a la derecha, cerrar o
-volver a abrir desde `Ver` / el botón **Explorador**.
+volver a abrir desde `Ver` / el botón **Explorador**. La barra de herramientas se oculta
+con el botón **Ocultar** (o `Ver → Barra de herramientas`) para ganar espacio en portátiles.
 
 * Muestra **carpetas y archivos** (imágenes, PDF, texto o cualquier otro).
 * Arrastra un archivo y suéltalo encima de **un terminal concreto** para pegar su ruta
@@ -209,7 +210,7 @@ Si aun así no lo encuentra, pon la ruta absoluta en el agente:
   diseño inicial, agente por defecto, carpeta inicial, tecla Escape (al terminal o Host Key),
   cursor parpadeante y «recordar sesión al reiniciar» (pestañas, paneles, agentes y geometría).
 * Todo se guarda en `~/.config/rncli/`:
-  `config.json` (ajustes y agentes) y `session.json` (sesión, si la activas).
+  `config.json` (ajustes y agentes) y `session.json` (pestañas y paneles; se restaura al abrir).
 * Si algo va mal, el registro de errores está en `~/.config/rncli/rncli.log`.
 
 ## sudo para los agentes

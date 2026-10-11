@@ -99,6 +99,7 @@ def login_path() -> str:
         for flags in SHELL_FLAGS:
             value = _ask_shell(shell, flags)
             if value:
+                # PATH del shell primero: es el que conoce ~/.local/bin, mise, etc.
                 current = _merge(value, current)
                 break
 
@@ -114,7 +115,12 @@ def search_dirs() -> list[str]:
 
 
 def resolve_executable(name: str) -> str | None:
-    """Ruta absoluta del ejecutable, o None si no se encuentra."""
+    """Ruta absoluta del ejecutable, o None si no se encuentra.
+
+    Prioriza los directorios típicos de agentes (``~/.opencode/bin``,
+    ``~/.pi/agent/bin``…) frente al PATH: así un binario local gana al
+    shim de mise en ``~/.local/bin``.
+    """
     name = (name or "").strip()
     if not name:
         return None
@@ -122,15 +128,12 @@ def resolve_executable(name: str) -> str | None:
         candidate = os.path.expanduser(name)
         return candidate if os.access(candidate, os.X_OK) else None
 
-    found = shutil.which(name, path=login_path())
-    if found:
-        return found
-
     for directory in search_dirs():
         candidate = os.path.join(directory, name)
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    return None
+
+    return shutil.which(name, path=login_path())
 
 
 def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:

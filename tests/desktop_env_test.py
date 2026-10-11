@@ -55,7 +55,7 @@ app = QApplication(["rncli-test"])
 config = Config.load()
 config.settings.restore_session = False
 config.settings.start_dir = "/tmp"
-window = MainWindow(config)
+window = MainWindow(config, restore=False)
 window.resize(1000, 640)
 window.show()
 wait(500)

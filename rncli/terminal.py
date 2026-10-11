@@ -6,10 +6,11 @@ import math
 import os
 import re
 import shlex
+import unicodedata
 
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPalette
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QInputMethodEvent, QPainter, QPalette
+from PySide6.QtWidgets import QApplication, QScrollBar, QWidget
 
 from .theme import brighten, resolve_color, theme
 from .vt_engine import make_engine
@@ -59,6 +60,49 @@ CURSOR_KEYS = {
     Qt.Key.Key_Home: "H",
     Qt.Key.Key_End: "F",
 }
+
+#: Teclas muertas (acentos agudo, grave, circunflejo, diéresis, etc.) y sus diacríticos
+DEAD_KEYS = {
+    Qt.Key.Key_Dead_Acute: ("\u0301", "´"),
+    Qt.Key.Key_Dead_Grave: ("\u0300", "`"),
+    Qt.Key.Key_Dead_Circumflex: ("\u0302", "^"),
+    Qt.Key.Key_Dead_Tilde: ("\u0303", "~"),
+    Qt.Key.Key_Dead_Diaeresis: ("\u0308", "¨"),
+    Qt.Key.Key_Dead_Cedilla: ("\u0327", "¸"),
+    Qt.Key.Key_Dead_Macron: ("\u0304", "¯"),
+    Qt.Key.Key_Dead_Breve: ("\u0306", "˘"),
+    Qt.Key.Key_Dead_Abovedot: ("\u0307", "˙"),
+    Qt.Key.Key_Dead_Abovering: ("\u030a", "˚"),
+    Qt.Key.Key_Dead_Doubleacute: ("\u030b", "˝"),
+    Qt.Key.Key_Dead_Caron: ("\u030c", "ˇ"),
+    Qt.Key.Key_Dead_Ogonek: ("\u0328", "˛"),
+    Qt.Key.Key_Dead_Iota: ("\u0345", "ͺ"),
+}
+
+
+def compose_dead_key(dead_key: int, text: str) -> str:
+    """Compone una tecla muerta con el texto del carácter recibido."""
+    comb, spaced = DEAD_KEYS.get(dead_key, ("", ""))
+    if not comb:
+        return text
+    if text == " ":
+        return spaced
+    if len(text) == 1 and len(unicodedata.normalize("NFD", text)) > 1:
+        return text
+    norm = unicodedata.normalize("NFC", text + comb)
+    return norm if len(norm) == 1 else (spaced + text)
+
+
+#: XTVERSION (CSI > Ps q). OpenCode/OpenTUI lo exige antes de pintar la TUI.
+XTVERSION_RE = re.compile(rb"\x1b\[>(?:0)?q")
+XTVERSION_REPLY = b"\x1bP>|rncli\x1b\\"
+
+
+def capability_replies(data: bytes) -> bytes:
+    """Respuestas a sondeos que alacritty no reenvía por PtyWrite."""
+    if XTVERSION_RE.search(data):
+        return XTVERSION_REPLY
+    return b""
 
 # Modificadores que no deben acompañar a Tab ni a Escape-como-Host-Key.
 _NAV_MODS = (
@@ -149,6 +193,10 @@ class TerminalWidget(QWidget):
         self._engine = make_engine(80, 24, int(settings.scrollback))
         self._screen = self._engine.screen
         self._scroll_offset = 0
+        self._scrollbar: QScrollBar | None = None
+        self._updating_scrollbar = False
+        self._pending_dead_key: int | None = None
+        self._xtversion_sent = False
         self._last_title = ""
         self._bell_pending = False
         self._raw_tail = b""
@@ -182,6 +230,7 @@ class TerminalWidget(QWidget):
             self._blink_timer.start()
 
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_InputMethodEnabled, True)
         self.setAutoFillBackground(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.IBeamCursor)
@@ -221,6 +270,10 @@ class TerminalWidget(QWidget):
         self._cell_w = float(max(1, math.ceil(metrics.horizontalAdvance("M"))))
         self._cell_h = float(max(1, math.ceil(metrics.height())))
         self._ascent = metrics.ascent()
+        # Las TUI modernas (OpenCode/OpenTUI) preguntan el tamaño en píxeles.
+        setter = getattr(self._engine, "set_cell_size", None)
+        if callable(setter):
+            setter(int(self._cell_w), int(self._cell_h))
 
     def set_font(self, family: str, size: int) -> None:
         self._font = QFont(family)
@@ -254,8 +307,11 @@ class TerminalWidget(QWidget):
             self._engine.resize(cols, rows)
             self.session.resize(cols, rows)
             self._scroll_offset = min(self._scroll_offset, self._history_len())
+            self._sync_scrollbar()
             self.sizeChanged.emit(cols, rows)
             self.update()
+        else:
+            self._sync_scrollbar()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 (API Qt)
         super().resizeEvent(event)
@@ -340,16 +396,27 @@ class TerminalWidget(QWidget):
             data, self._raw_tail = self.sanitize(data, self._raw_tail)
         if not data:
             return
+        extra = b""
+        if not self._xtversion_sent:
+            extra = capability_replies(data)
+            if extra:
+                self._xtversion_sent = True
         try:
             replies = self._engine.feed(data)
         except Exception:
             return
         if replies:
             self.session.write(replies)
+        if extra:
+            # OpenTUI (OpenCode) ignora XTVERSION si llega en el mismo turno de
+            # lectura que las demás respuestas; diferir un tick lo desbloquea.
+            QTimer.singleShot(50, lambda e=extra: self._write_capability(e))
         grown = self._history_len() - before
         if self._scroll_offset > 0 and grown:
             # mantenemos a la vista el mismo contenido mientras llega salida nueva
             self._scroll_offset = min(self._history_len(), self._scroll_offset + grown)
+
+        self._sync_scrollbar()
 
         if self._engine.take_bell():
             self._emit_bell()
@@ -367,6 +434,14 @@ class TerminalWidget(QWidget):
     def feed_text(self, text: str) -> None:
         """Escribe texto generado por la propia aplicación en el búfer."""
         self._feed(text.replace("\n", "\r\n").encode("utf-8", "replace"))
+
+    def _write_capability(self, data: bytes) -> None:
+        if not data or self.session is None or not self.session.is_alive():
+            return
+        try:
+            self.session.write(data)
+        except OSError:
+            return
 
     def _schedule_repaint(self) -> None:
         self._screen.dirty.clear()
@@ -413,6 +488,46 @@ class TerminalWidget(QWidget):
             event.accept()
             return
 
+        # Teclas modificadoras solas no cancelan el scroll ni se envían a la sesión
+        if key in (
+            Qt.Key.Key_Shift,
+            Qt.Key.Key_Control,
+            Qt.Key.Key_Alt,
+            Qt.Key.Key_Meta,
+        ):
+            return
+
+        # Teclas muertas (acentos, diéresis, etc.)
+        if key in DEAD_KEYS:
+            if self._pending_dead_key is not None:
+                spaced = DEAD_KEYS.get(self._pending_dead_key, ("", ""))[1]
+                if spaced:
+                    self.session.write(spaced.encode("utf-8", "replace"))
+            self._pending_dead_key = key
+            event.accept()
+            return
+
+        if self._pending_dead_key is not None:
+            dead = self._pending_dead_key
+            self._pending_dead_key = None
+            if key in (Qt.Key.Key_Backspace, Qt.Key.Key_Escape):
+                event.accept()
+                return
+            text = event.text()
+            if text and not (ctrl or alt):
+                composed = compose_dead_key(dead, text)
+                if self._scroll_offset:
+                    self.scroll_to_bottom()
+                data = composed.encode("utf-8", "replace")
+                self.session.write(data)
+                self.inputReady.emit(data)
+                event.accept()
+                return
+            else:
+                spaced = DEAD_KEYS.get(dead, ("", ""))[1]
+                if spaced:
+                    self.session.write(spaced.encode("utf-8", "replace"))
+
         # Atajos de la propia terminal
         if ctrl and shift and key == Qt.Key.Key_C:
             self.copy_selection()
@@ -424,12 +539,30 @@ class TerminalWidget(QWidget):
             self.select_all()
             return
 
-        if self._scroll_offset and key not in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown):
-            self.scroll_to_bottom()
+        # Navegación por el historial con teclado (Shift+PageUp, Shift+PageDown, etc.)
+        if shift and not ctrl and not alt:
+            page = max(1, self._screen.lines - 2)
+            if key == Qt.Key.Key_PageUp:
+                self.scroll_by(page)
+                return
+            if key == Qt.Key.Key_PageDown:
+                self.scroll_by(-page)
+                return
+            if key == Qt.Key.Key_Up:
+                self.scroll_by(1)
+                return
+            if key == Qt.Key.Key_Down:
+                self.scroll_by(-1)
+                return
+            if key == Qt.Key.Key_Home:
+                self.scroll_to_top()
+                return
+            if key == Qt.Key.Key_End:
+                self.scroll_to_bottom()
+                return
 
-        if key in (Qt.Key.Key_PageUp, Qt.Key.Key_PageDown) and shift:
-            self.scroll_by(10 if key == Qt.Key.Key_PageUp else -10)
-            return
+        if self._scroll_offset:
+            self.scroll_to_bottom()
 
         if not self.session.is_alive():
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -446,6 +579,27 @@ class TerminalWidget(QWidget):
             event.accept()
             return
         super().keyReleaseEvent(event)
+
+    def inputMethodEvent(self, event: QInputMethodEvent) -> None:  # noqa: N802
+        self._pending_dead_key = None
+        text = event.commitString()
+        if text:
+            if self._scroll_offset:
+                self.scroll_to_bottom()
+            data = text.encode("utf-8", "replace")
+            self.session.write(data)
+            self.inputReady.emit(data)
+        event.accept()
+
+    def inputMethodQuery(self, query: Qt.InputMethodQuery) -> object:  # noqa: N802
+        if query == Qt.InputMethodQuery.ImCursorRectangle:
+            cx, cy = self._screen.cursor.x, self._screen.cursor.y
+            cell_w, cell_h = max(1, int(self._cell_w)), max(1, int(self._cell_h))
+            base = self._history_len() - self._scroll_offset
+            return QRect(int(PAD_X + cx * cell_w), int(PAD_Y + cy * cell_h), cell_w, cell_h)
+        if query == Qt.InputMethodQuery.ImFont:
+            return self._font
+        return super().inputMethodQuery(query)
 
     def _encode_key(self, event, key, ctrl: bool, alt: bool, shift: bool) -> bytes:
         app_cursor = 1 in getattr(self._screen, "mode", set())
@@ -567,6 +721,7 @@ class TerminalWidget(QWidget):
         self.setFocus(Qt.FocusReason.MouseFocusReason)
         self._blink_timer.stop()
         self._cursor_on = True
+        self._pending_dead_key = None
         if event.button() == Qt.MouseButton.LeftButton:
             # Un clic para enfocar no es una selección: si pintamos esa celda
             # queda un cuadrado azul permanente en cada terminal.
@@ -646,11 +801,56 @@ class TerminalWidget(QWidget):
         self._sel_visible = True
         self.update()
 
+    def attach_scrollbar(self, scrollbar: QScrollBar) -> None:
+        """Conecta una barra de desplazamiento vertical con la terminal."""
+        self._scrollbar = scrollbar
+        scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
+        self._sync_scrollbar()
+
+    def _on_scrollbar_value_changed(self, value: int) -> None:
+        if self._updating_scrollbar:
+            return
+        limit = self._history_len()
+        new_offset = max(0, min(limit, limit - value))
+        if new_offset != self._scroll_offset:
+            self._scroll_offset = new_offset
+            self.update()
+
+    def _sync_scrollbar(self) -> None:
+        if self._scrollbar is None:
+            return
+        limit = self._history_len()
+        lines = max(1, self._screen.lines)
+        self._updating_scrollbar = True
+        try:
+            self._scrollbar.setRange(0, limit)
+            self._scrollbar.setPageStep(lines)
+            self._scrollbar.setSingleStep(1)
+            self._scrollbar.setValue(limit - self._scroll_offset)
+            self._scrollbar.setEnabled(limit > 0)
+        finally:
+            self._updating_scrollbar = False
+
     def wheelEvent(self, event) -> None:  # noqa: N802
         delta = event.angleDelta().y()
-        if delta == 0:
+        pixel_delta = event.pixelDelta().y()
+        lines = 0
+        if delta != 0:
+            # En ratón estándar: 120 unidades por paso -> ~3 líneas por muesca
+            steps = delta / 120.0
+            lines = int(steps * 3)
+            if lines == 0:
+                lines = 1 if delta > 0 else -1
+        elif pixel_delta != 0:
+            # Touchpad de alta resolución
+            lines = int(pixel_delta / max(1.0, self._cell_h))
+            if lines == 0:
+                lines = 1 if pixel_delta > 0 else -1
+
+        if lines == 0:
             return
-        self.scroll_by(3 if delta > 0 else -3)
+
+        self.scroll_by(lines)
         event.accept()
 
     def scroll_by(self, lines: int) -> None:
@@ -658,11 +858,20 @@ class TerminalWidget(QWidget):
         new_offset = max(0, min(limit, self._scroll_offset + lines))
         if new_offset != self._scroll_offset:
             self._scroll_offset = new_offset
+            self._sync_scrollbar()
+            self.update()
+
+    def scroll_to_top(self) -> None:
+        limit = self._history_len()
+        if self._scroll_offset != limit:
+            self._scroll_offset = limit
+            self._sync_scrollbar()
             self.update()
 
     def scroll_to_bottom(self) -> None:
         if self._scroll_offset:
             self._scroll_offset = 0
+            self._sync_scrollbar()
             self.update()
 
     def _cell_at(self, x: float, y: float) -> tuple[int, int] | None:
@@ -869,4 +1078,5 @@ class TerminalWidget(QWidget):
         self._blink_timer.stop()
         self._cursor_on = False
         self._last_cursor = None
+        self._pending_dead_key = None
         self.update()

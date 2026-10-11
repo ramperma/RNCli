@@ -110,12 +110,121 @@ DEFAULT_AGENTS: list[Agent] = [
         description="Gemini CLI de Google (usa GEMINI_API_KEY).",
     ),
     Agent(
+        id="antigravity",
+        name="Antigravity",
+        command=["agy"],
+        emoji="🌌",
+        color="#4285f4",
+        description="Google Antigravity CLI (agy).",
+    ),
+    Agent(
         id="shell",
         name="Bash",
         command=["bash", "-l"],
         emoji="$",
         color="#9ca3af",
         description="Shell de login normal.",
+    ),
+]
+
+#: Catálogo extendido de agentes de IA y shells conocidos para escanear
+KNOWN_AGENTS: list[Agent] = [
+    *DEFAULT_AGENTS,
+    Agent(
+        id="aider",
+        name="Aider",
+        command=["aider"],
+        emoji="🧠",
+        color="#a78bfa",
+        description="Aider: AI pair programming en la terminal.",
+    ),
+    Agent(
+        id="goose",
+        name="Goose",
+        command=["goose"],
+        emoji="🪿",
+        color="#34d399",
+        description="Goose: agente de código autónomo de Block.",
+    ),
+    Agent(
+        id="interpreter",
+        name="Open Interpreter",
+        command=["interpreter"],
+        emoji="💬",
+        color="#f472b6",
+        description="Open Interpreter: ejecución local de código con LLM.",
+    ),
+    Agent(
+        id="ollama",
+        name="Ollama",
+        command=["ollama"],
+        emoji="🦙",
+        color="#fbbf24",
+        description="Ollama: modelos LLM locales en la terminal.",
+    ),
+    Agent(
+        id="copilot",
+        name="GitHub Copilot",
+        command=["copilot"],
+        emoji="🐙",
+        color="#818cf8",
+        description="GitHub Copilot CLI.",
+    ),
+    Agent(
+        id="fabric",
+        name="Fabric",
+        command=["fabric"],
+        emoji="🧵",
+        color="#38bdf8",
+        description="Fabric: framework open-source para aumentar humanos con IA.",
+    ),
+    Agent(
+        id="sgpt",
+        name="Shell GPT",
+        command=["sgpt"],
+        emoji="⚡",
+        color="#10b981",
+        description="Shell GPT: interfaz CLI para interactuar con LLMs.",
+    ),
+    Agent(
+        id="llm",
+        name="Datasette LLM",
+        command=["llm"],
+        emoji="🗂",
+        color="#6366f1",
+        description="LLM: herramienta de línea de órdenes de Simon Willison.",
+    ),
+    Agent(
+        id="plandex",
+        name="Plandex",
+        command=["plandex"],
+        emoji="📋",
+        color="#f97316",
+        description="Plandex: AI coding agent para tareas complejas.",
+    ),
+    Agent(
+        id="mentat",
+        name="Mentat",
+        command=["mentat"],
+        emoji="🔍",
+        color="#ec4899",
+        description="Mentat: asistente de código que coordina cambios en git.",
+    ),
+    Agent(
+        id="zsh",
+        name="Zsh",
+        command=["zsh", "-l"],
+        emoji="%",
+        color="#9ca3af",
+        description="Z Shell de login.",
+    ),
+    Agent(
+        id="fish",
+        name="Fish",
+        command=["fish", "-l"],
+        emoji="🐟",
+        color="#9ca3af",
+        description="Friendly Interactive Shell.",
     ),
 ]
 
@@ -127,11 +236,36 @@ AGENT_ALIASES = {
     "cursor-agent": "cursor",
     "sh": "shell",
     "terminal": "shell",
+    "open-interpreter": "interpreter",
+    "github-copilot": "copilot",
+    "shell-gpt": "sgpt",
+    "agy": "antigravity",
+    "google-antigravity": "antigravity",
+    "antigravity-cli": "antigravity",
 }
 
 
 def default_agents() -> list[Agent]:
     return [Agent.from_dict(agent.to_dict()) for agent in DEFAULT_AGENTS]
+
+
+def catalog_agents(current_agents: list[Agent] | None = None) -> list[Agent]:
+    """Lista combinada de agentes del catálogo y los configurados por el usuario."""
+    result: list[Agent] = []
+    seen_ids: set[str] = set()
+
+    if current_agents:
+        for agent in current_agents:
+            if agent.id not in seen_ids:
+                result.append(Agent.from_dict(agent.to_dict()))
+                seen_ids.add(agent.id)
+
+    for agent in KNOWN_AGENTS:
+        if agent.id not in seen_ids:
+            result.append(Agent.from_dict(agent.to_dict()))
+            seen_ids.add(agent.id)
+
+    return result
 
 
 def find_agent(agents: list[Agent], agent_id: str) -> Agent | None:

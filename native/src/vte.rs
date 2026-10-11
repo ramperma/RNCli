@@ -8,9 +8,39 @@ use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+
+/// Paleta xterm básica + fg/bg por defecto (índices NamedColor).
+fn default_color(index: usize) -> Rgb {
+    const PALETTE: [(u8, u8, u8); 16] = [
+        (0x1e, 0x1e, 0x2e), // black
+        (0xf3, 0x8b, 0xa8), // red
+        (0xa6, 0xe3, 0xa1), // green
+        (0xf9, 0xe2, 0xaf), // yellow
+        (0x89, 0xb4, 0xfa), // blue
+        (0xf5, 0xc2, 0xe7), // magenta
+        (0x94, 0xe2, 0xd5), // cyan
+        (0xcd, 0xd6, 0xf4), // white
+        (0x45, 0x47, 0x5a), // bright black
+        (0xf3, 0x8b, 0xa8), // bright red
+        (0xa6, 0xe3, 0xa1), // bright green
+        (0xf9, 0xe2, 0xaf), // bright yellow
+        (0x89, 0xb4, 0xfa), // bright blue
+        (0xf5, 0xc2, 0xe7), // bright magenta
+        (0x94, 0xe2, 0xd5), // bright cyan
+        (0xff, 0xff, 0xff), // bright white
+    ];
+    let (r, g, b) = match index {
+        0..=15 => PALETTE[index],
+        i if i == NamedColor::Foreground as usize => (0xcd, 0xd6, 0xf4),
+        i if i == NamedColor::Background as usize => (0x1e, 0x1e, 0x2e),
+        i if i == NamedColor::Cursor as usize => (0xf5, 0xe0, 0xdc),
+        _ => (0x80, 0x80, 0x80),
+    };
+    Rgb { r, g, b }
+}
 
 #[derive(Clone)]
 struct TermSize {
@@ -38,6 +68,8 @@ struct BusInner {
     writes: Vec<u8>,
     cols: u16,
     rows: u16,
+    cell_width: u16,
+    cell_height: u16,
 }
 
 #[derive(Clone)]
@@ -51,12 +83,16 @@ impl EventListener for Bus {
             Event::ResetTitle => inner.title.clear(),
             Event::Bell => inner.bell = true,
             Event::PtyWrite(data) => inner.writes.extend(data.as_bytes()),
+            Event::ColorRequest(index, callback) => {
+                let reply = callback(default_color(index));
+                inner.writes.extend(reply.as_bytes());
+            }
             Event::TextAreaSizeRequest(callback) => {
                 let reply = callback(WindowSize {
                     num_lines: inner.rows,
                     num_cols: inner.cols,
-                    cell_width: 1,
-                    cell_height: 1,
+                    cell_width: inner.cell_width.max(1),
+                    cell_height: inner.cell_height.max(1),
                 });
                 inner.writes.extend(reply.as_bytes());
             }
@@ -218,6 +254,9 @@ impl NativeVte {
             writes: Vec::new(),
             cols: cols as u16,
             rows: rows as u16,
+            // Valores realistas hasta que Python informe el tamaño tipográfico.
+            cell_width: 9,
+            cell_height: 18,
         })));
         let mut config = Config::default();
         config.scrolling_history = scrollback.max(200);
@@ -253,6 +292,13 @@ impl NativeVte {
             columns: cols,
             screen_lines: rows,
         });
+    }
+
+    /// Informa el tamaño de celda en píxeles (para CSI 14/16 t de TUIs modernas).
+    fn set_cell_size(&mut self, width: u16, height: u16) {
+        let mut inner = self.bus.0.borrow_mut();
+        inner.cell_width = width.max(1);
+        inner.cell_height = height.max(1);
     }
 
     fn columns(&self) -> usize {

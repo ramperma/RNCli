@@ -119,12 +119,10 @@ def main(argv: list[str] | None = None) -> int:
         app.setWindowIcon(QIcon(str(icon_path)))
 
     config = Config.load()
-    if args.no_restore:
-        config.settings.restore_session = False
     if args.cwd:
         config.settings.start_dir = str(Path(args.cwd).expanduser())
 
-    window = MainWindow(config)
+    window = MainWindow(config, restore=False if args.no_restore else None)
     if args.agent:
         agent = config.agent(args.agent)
         if agent is not None:

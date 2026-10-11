@@ -163,6 +163,11 @@ class NativeEngine:
     def resize(self, cols: int, rows: int) -> None:
         self._vte.resize(int(cols), int(rows))
 
+    def set_cell_size(self, width: int, height: int) -> None:
+        setter = getattr(self._vte, "set_cell_size", None)
+        if callable(setter):
+            setter(max(1, int(width)), max(1, int(height)))
+
     def columns(self) -> int:
         return int(self._vte.columns())
 
@@ -212,6 +217,9 @@ class PyteEngine:
 
     def resize(self, cols: int, rows: int) -> None:
         self.screen.resize(lines=int(rows), columns=int(cols))
+
+    def set_cell_size(self, width: int, height: int) -> None:
+        return None
 
     def columns(self) -> int:
         return int(self.screen.columns)

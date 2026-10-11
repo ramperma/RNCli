@@ -29,6 +29,7 @@ from .agents import Agent, pick_default_agent
 from .config import LAYOUTS, Config, Settings, load_session, save_session
 from .dialogs import (
     AgentChooserDialog,
+    AgentManagerDialog,
     SettingsDialog,
     ShortcutsDialog,
     SshDialog,
@@ -73,10 +74,16 @@ class PromptBar(QLineEdit):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, restore: bool | None = None) -> None:
         super().__init__()
         self.config = config
         self.settings: Settings = config.settings
+        # La sesión se restaura siempre al abrir, salvo --no-restore o tests.
+        # El checkbox de ajustes se honra si restore no viene forzado por CLI.
+        if restore is None:
+            self._restore_session = True
+        else:
+            self._restore_session = bool(restore)
         self._zoom_applied = 0
         self._host_mode = False
         self._shortcut_actions: list[QAction] = []
@@ -238,6 +245,7 @@ class MainWindow(QMainWindow):
         self.act_new_ssh = self._act(
             "Nueva conexión SSH…", "Ctrl+Shift+S", lambda: self.choose_ssh()
         )
+        self.act_manage_agents = self._act("Asistente de agentes…", None, self.open_agent_manager)
         self.act_settings = self._act("Ajustes…", None, self.open_settings)
         self.act_open_config = self._act("Abrir config.json", None, self.open_config)
         self.act_sudo = self._act("Sudo para agentes…", None, self.open_sudo)
@@ -340,6 +348,7 @@ class MainWindow(QMainWindow):
         tools_menu = bar.addMenu("&Herramientas")
         tools_menu.addAction(self.act_restart)
         tools_menu.addSeparator()
+        tools_menu.addAction(self.act_manage_agents)
         tools_menu.addAction(self.act_sudo)
         tools_menu.addAction(self.act_open_config)
         tools_menu.addAction(self.act_settings)
@@ -351,11 +360,11 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about)
 
     def _build_toolbar(self) -> None:
-        toolbar = QToolBar("Principal", self)
-        toolbar.setMovable(False)
-        toolbar.setFloatable(False)
-        toolbar.setIconSize(QSize(16, 16))
-        self.addToolBar(toolbar)
+        self.toolbar = QToolBar("Principal", self)
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setIconSize(QSize(16, 16))
+        self.addToolBar(self.toolbar)
 
         new_pane = self._chrome_button(
             "+ Panel",
@@ -372,14 +381,14 @@ class MainWindow(QMainWindow):
             "Conectar por SSH a un equipo remoto (Ctrl+Shift+S)",
             lambda: self.choose_ssh(),
         )
-        toolbar.addWidget(new_pane)
-        toolbar.addWidget(new_tab)
-        toolbar.addWidget(new_ssh)
-        toolbar.addSeparator()
+        self.toolbar.addWidget(new_pane)
+        self.toolbar.addWidget(new_tab)
+        self.toolbar.addWidget(new_ssh)
+        self.toolbar.addSeparator()
 
         caption = QLabel("DISEÑO")
         caption.setObjectName("LayoutCaption")
-        toolbar.addWidget(caption)
+        self.toolbar.addWidget(caption)
 
         segment = QWidget()
         segment.setObjectName("LayoutSegment")
@@ -401,7 +410,7 @@ class MainWindow(QMainWindow):
             self.layout_button_group.addButton(button)
             self.layout_buttons[mode] = button
             row.addWidget(button)
-        toolbar.addWidget(segment)
+        self.toolbar.addWidget(segment)
 
         broadcast = self._chrome_button(
             "Difusión",
@@ -410,11 +419,11 @@ class MainWindow(QMainWindow):
         )
         broadcast.toggled.connect(self._on_broadcast_button)
         self.broadcast_button = broadcast
-        toolbar.addWidget(broadcast)
+        self.toolbar.addWidget(broadcast)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        toolbar.addWidget(spacer)
+        self.toolbar.addWidget(spacer)
 
         files = self._chrome_button(
             "Explorador",
@@ -423,10 +432,10 @@ class MainWindow(QMainWindow):
             checkable=True,
         )
         self.file_button = files
-        toolbar.addWidget(files)
+        self.toolbar.addWidget(files)
 
         settings_button = self._chrome_button("Ajustes", "Ajustes de RNCli", self.open_settings)
-        toolbar.addWidget(settings_button)
+        self.toolbar.addWidget(settings_button)
 
         more = self._chrome_button("···", "Más acciones")
         more.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -438,7 +447,27 @@ class MainWindow(QMainWindow):
         more_menu.addAction(self.act_sudo)
         more_menu.addAction(self.act_help)
         more.setMenu(more_menu)
-        toolbar.addWidget(more)
+        self.toolbar.addWidget(more)
+
+        hide_bar = self._chrome_button(
+            "Ocultar",
+            "Ocultar la barra de herramientas (más espacio). Para mostrarla: Ver → Barra de herramientas",
+            lambda: self.toolbar.setVisible(False),
+        )
+        self.toolbar.addWidget(hide_bar)
+
+        self.toolbar.setVisible(self.settings.show_toolbar)
+        self.act_toolbar = self.toolbar.toggleViewAction()
+        self.act_toolbar.setText("Barra de herramientas")
+        self.act_toolbar.setToolTip("Mostrar u ocultar la barra de herramientas · útil en pantallas pequeñas")
+        self.toolbar.visibilityChanged.connect(self._on_toolbar_visibility)
+        more_menu.addSeparator()
+        more_menu.addAction(self.act_toolbar)
+        for menu_action in self.menuBar().actions():
+            if menu_action.text().replace("&", "") == "Ver" and menu_action.menu() is not None:
+                menu_action.menu().addSeparator()
+                menu_action.menu().addAction(self.act_toolbar)
+                break
 
     def _build_tabs(self) -> None:
         self.tabs = QTabWidget(self)
@@ -511,6 +540,14 @@ class MainWindow(QMainWindow):
 
     def _toggle_file_browser(self, visible: bool) -> None:
         self.file_dock.setVisible(visible)
+
+    def _on_toolbar_visibility(self, visible: bool) -> None:
+        visible = bool(visible)
+        if self.settings.show_toolbar == visible:
+            return
+        self.settings.show_toolbar = visible
+        self.config.settings = self.settings
+        self.config.save()
 
     def _on_show_hidden_action(self, checked: bool) -> None:
         self.file_browser.set_show_hidden(bool(checked))
@@ -592,7 +629,7 @@ class MainWindow(QMainWindow):
         holder.layout().addWidget(container)
 
     def _restore_geometry(self) -> None:
-        geometry = (load_session() or {}).get("geometry") if self.settings.restore_session else None
+        geometry = (load_session() or {}).get("geometry") if self._restore_session else None
         if isinstance(geometry, str) and geometry:
             try:
                 self.restoreGeometry(QByteArray.fromBase64(geometry.encode()))
@@ -601,7 +638,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ sesión
     def _restore_or_create_session(self) -> None:
-        tabs = load_session().get("tabs", []) if self.settings.restore_session else []
+        session = load_session() if self._restore_session else {}
+        tabs = session.get("tabs", [])
         created = False
         for tab in tabs if isinstance(tabs, list) else []:
             panes = tab.get("panes") or []
@@ -624,6 +662,21 @@ class MainWindow(QMainWindow):
                 self._remove_workspace(workspace)
         if not created:
             self.new_tab()
+        self._restore_file_browser(session)
+
+    def _restore_file_browser(self, session: dict) -> None:
+        browser = session.get("file_browser") if isinstance(session, dict) else None
+        path = ""
+        if isinstance(browser, dict):
+            path = str(browser.get("path") or "")
+            if "visible" in browser:
+                self.file_dock.setVisible(bool(browser.get("visible")))
+        if not path:
+            workspace = self.workspace()
+            pane = workspace.active_pane() if workspace is not None else None
+            path = pane.cwd if pane is not None else self.settings.start_dir
+        if path:
+            self.file_browser.set_root(path)
 
     @staticmethod
     def _agent_from_state(pane: dict) -> Agent | None:
@@ -693,7 +746,9 @@ class MainWindow(QMainWindow):
         hint = cwd_hint or (
             workspace.active_pane().shell_cwd() if workspace and workspace.active_pane() else ""
         )
-        dialog = AgentChooserDialog(self.config.agents, self.settings, self, cwd_hint=hint)
+        dialog = AgentChooserDialog(
+            self.config.agents, self.settings, self, cwd_hint=hint, config=self.config
+        )
         if dialog.exec() != AgentChooserDialog.DialogCode.Accepted:
             return
         if dialog.wants_ssh():
@@ -1012,16 +1067,24 @@ class MainWindow(QMainWindow):
             if isinstance(workspace, WorkspaceWidget):
                 workspace.apply_settings(self.settings, self.settings.theme)
 
+    def open_agent_manager(self) -> None:
+        dialog = AgentManagerDialog(self.config, self)
+        if dialog.exec() == AgentManagerDialog.DialogCode.Accepted:
+            self.settings = self.config.settings
+            self._update_status()
+
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.settings, self.config.agents, self)
+        dialog = SettingsDialog(self.settings, self.config.agents, self, config=self.config)
         if dialog.exec() != SettingsDialog.DialogCode.Accepted:
             return
         self.settings = dialog.result_settings(self.settings)
         self.config.settings = self.settings
         self.config.save()
+        self._restore_session = True
         self.apply_theme()
         self._apply_settings_to_workspaces()
         self.file_browser.set_show_hidden(self.settings.show_hidden_files)
+        self.toolbar.setVisible(self.settings.show_toolbar)
         self._update_status()
 
     def open_config(self) -> None:
@@ -1172,11 +1235,26 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        if self.settings.restore_session:
-            tabs = [workspace.state() for workspace in self._workspaces()]
-            save_session(tabs, bytes(self.saveGeometry().toBase64()).decode())
+        self._persist_session()
         self._shutdown()
         event.accept()
+
+    def _persist_session(self) -> None:
+        """Guarda pestañas, paneles, explorador y geometría."""
+        try:
+            tabs = [workspace.state() for workspace in self._workspaces()]
+            save_session(
+                tabs,
+                bytes(self.saveGeometry().toBase64()).decode(),
+                extra={
+                    "file_browser": {
+                        "visible": self.file_dock.isVisible(),
+                        "path": self.file_browser.current_dir,
+                    }
+                },
+            )
+        except Exception:
+            pass
 
     def _shutdown(self) -> None:
         if getattr(self, "_shutdown_done", False):
@@ -1185,8 +1263,9 @@ class MainWindow(QMainWindow):
         for workspace in self._workspaces():
             if isinstance(workspace, WorkspaceWidget):
                 workspace.shutdown()
-        self.config.save()
 
     def shutdown(self) -> None:
         """Cierre ordenado (lo usa también el manejador de señales)."""
+        if not getattr(self, "_shutdown_done", False):
+            self._persist_session()
         self._shutdown()
