@@ -48,6 +48,7 @@ SHORTCUT_DEFAULTS: dict[str, str] = {
     "help": "F1",
     "toggle_files": "Ctrl+Shift+E",
     "toggle_toolbar": "Ctrl+Shift+H",
+    "host_mode": "Ctrl+Shift+Space",
     "layout_1": "Alt+1",
     "layout_2v": "Alt+2",
     "layout_2h": "Alt+3",
@@ -57,8 +58,8 @@ SHORTCUT_DEFAULTS: dict[str, str] = {
 }
 
 # Preset con los atajos simples del RNCli clásico. Ojo: Ctrl+T/Ctrl+W/Ctrl+Q y
-# Alt+flechas coinciden con atajos de los agentes; con este preset hay que usar
-# la Host Key (Ctrl derecho) para que el chasis funcione dentro de una TUI.
+# Alt+flechas coinciden con atajos de los agentes; con este preset hay que entrar
+# en MODO RNCli (Ctrl+Shift+Space) para que el chasis funcione dentro de una TUI.
 SHORTCUT_CLASSIC: dict[str, str] = {
     "new_tab": "Ctrl+T",
     "new_pane": "Ctrl+Shift+T",
@@ -91,6 +92,7 @@ SHORTCUT_LABELS: dict[str, str] = {
     "help": "Atajos y ayuda",
     "toggle_files": "Mostrar u ocultar el explorador",
     "toggle_toolbar": "Mostrar u ocultar la barra de herramientas",
+    "host_mode": "MODO RNCli: teclado para el chasis (menús y barra)",
     "layout_1": "Diseño: solo el panel activo",
     "layout_2v": "Diseño: dos paneles en paralelo",
     "layout_2h": "Diseño: dos paneles apilados",
@@ -107,7 +109,7 @@ SHORTCUT_SECTIONS: list[tuple[str, list[str]]] = [
                           "layout_all", "focus_next", "focus_prev", "maximize"]),
     ("Agente", ["restart", "broadcast"]),
     ("Vista y salida", ["zoom_in", "zoom_out", "zoom_reset", "fullscreen", "toggle_files",
-                        "toggle_toolbar", "help", "quit"]),
+                        "toggle_toolbar", "host_mode", "help", "quit"]),
 ]
 
 

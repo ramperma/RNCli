@@ -1117,11 +1117,12 @@ class ShortcutsDialog(QDialog):
 
     STATIC_ROWS: ClassVar[list[tuple[str, str | None]]] = [
         ("Terminal", None),
-        ("Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+A", "Copiar / pegar / seleccionar todo"),
+        ("Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+A", "Copiar / pegar / seleccionar todo (apagados en MODO AGENTE)"),
         ("Tab / Shift+Tab", "Siempre al terminal seleccionado (cursor-agent, Pi…)"),
-        ("Ctrl derecho", "Host Key tipo VirtualBox: MODO RNCli (foco en menús y barra inferior)"),
+        ("Ctrl derecho", "Host Key: alterna el MODO AGENTE (atajos del chasis apagados, "
+         "todas las teclas al agente); en MODO RNCli, sale de él"),
         ("Escape", "Configurable en Ajustes: al terminal o Host Key de RNCli"),
-        ("Shift+PageUp / Shift+PageDown", "Desplazarse por el historial"),
+        ("Shift+PageUp / Shift+PageDown", "Desplazarse por el historial (apagado en MODO AGENTE)"),
         ("Rueda del ratón", "Desplaza la TUI si pide el ratón (OpenCode); si no, el historial"),
         ("Shift + rueda", "Historial de la terminal aunque la TUI use el ratón"),
         ("Ctrl+H", "En el explorador: mostrar u ocultar archivos ocultos"),

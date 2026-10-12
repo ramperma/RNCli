@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QByteArray,
+    QEvent,
+    QPropertyAnimation,
+    QSize,
+    Qt,
+    QTimer,
+    Signal,
+)
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QGraphicsOpacityEffect,
     QDockWidget,
     QHBoxLayout,
     QLabel,
@@ -80,6 +89,59 @@ class PromptBar(QLineEdit):
         super().keyPressEvent(event)
 
 
+class ModeToast(QLabel):
+    """Aviso flotante semitransparente (OSD) sobre las terminales para los cambios de modo."""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setStyleSheet(
+            "QLabel { background-color: rgba(15, 15, 18, 215); color: #f5f5f5;"
+            " padding: 10px 20px; border-radius: 8px; }"
+        )
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._fade = QPropertyAnimation(self._effect, b"opacity", self)
+        self._fade.setDuration(450)
+        self._fade.setStartValue(1.0)
+        self._fade.setEndValue(0.0)
+        self._fade.finished.connect(self.hide)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self._start_fade)
+        parent.installEventFilter(self)
+        self.hide()
+
+    def show_message(self, text: str, hold_ms: int = 1800) -> None:
+        self._fade.stop()
+        self.setText(text)
+        self._effect.setOpacity(1.0)
+        self._reposition()
+        self.show()
+        self.raise_()
+        self._hide_timer.start(hold_ms)
+
+    def _start_fade(self) -> None:
+        if self.isVisible():
+            self._fade.start()
+
+    def _reposition(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.adjustSize()
+        x = max(0, (parent.width() - self.width()) // 2)
+        y = max(12, parent.height() // 3)
+        self.move(x, y)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self.parentWidget() and event.type() == QEvent.Type.Resize:
+            self._reposition()
+        return super().eventFilter(watched, event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: Config, *, restore: bool | None = None) -> None:
         super().__init__()
@@ -93,6 +155,7 @@ class MainWindow(QMainWindow):
             self._restore_session = bool(restore)
         self._zoom_applied = 0
         self._host_mode = False
+        self._agent_mode = False
         self._shortcut_actions: list[QAction] = []
         # Tabla única de atajos (action_id -> secuencia); ver config.SHORTCUT_DEFAULTS.
         self._shortcuts = merged_shortcuts(self.settings)
@@ -108,8 +171,9 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._build_prompt()
         # Los atajos del chasis viven en el espacio Ctrl+Shift+letra / Alt+dígito / F,
-        # que los agentes no usan, así que están siempre activos. Ctrl derecho sigue
-        # abriendo el MODO RNCli (menús, ratón y presets clásicos con colisiones).
+        # que los agentes no usan, así que están siempre activos. Ctrl derecho abre
+        # el MODO AGENTE: los atajos del chasis se apagan y todas las teclas van al
+        # agente. El MODO RNCli (menús, barra y ratón) tiene su propio atajo.
         self._restore_geometry()
 
         self._restore_or_create_session()
@@ -121,7 +185,7 @@ class MainWindow(QMainWindow):
             app.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
-        """Tab al agente; resto al terminal seleccionado; Host Key al chasis."""
+        """Tab al agente; resto al terminal seleccionado; Host Key alterna MODO AGENTE."""
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(watched, event)
 
@@ -142,7 +206,7 @@ class MainWindow(QMainWindow):
         ):
             # La Host Key también funciona con el foco en la barra inferior o el
             # explorador (la terminal solo la escucha cuando tiene el foco).
-            self._enter_host_mode(None)
+            self._on_host_key(None)
             event.accept()
             return True
         if self._host_mode:
@@ -191,6 +255,11 @@ class MainWindow(QMainWindow):
     def _apply_shortcut(self, action: QAction) -> None:
         action_id = str(action.property("rncliShortcutId") or "")
         sequence = self._shortcuts.get(action_id, "")
+        if self._agent_mode:
+            # MODO AGENTE: los atajos globales están apagados; las teclas llegan
+            # al agente. La tabla sigue intacta para restaurarlas al salir.
+            action.setShortcuts([])
+            return
         if action_id == "zoom_in":
             action.setShortcuts([QKeySequence(sequence), QKeySequence("Ctrl++")])
         else:
@@ -237,6 +306,19 @@ class MainWindow(QMainWindow):
             self._toggle_toolbar_shortcut,
             checkable=True,
         )
+        self.act_host_mode = self._act(
+            "host_mode", "MODO RNCli (teclado al chasis)", lambda: self._enter_host_mode(None)
+        )
+        # MODO AGENTE se alterna con la Host Key (Ctrl derecho); sin atajo en la
+        # tabla porque en ese modo los atajos del chasis están apagados.
+        self.act_agent_mode = QAction("MODO AGENTE (atajos al agente)", self)
+        self.act_agent_mode.setCheckable(True)
+        self.act_agent_mode.setToolTip(
+            "Apaga los atajos globales del chasis para que todas las teclas, "
+            "incluidas las que colisionan, lleguen al agente. Se alterna con Ctrl derecho."
+        )
+        self.act_agent_mode.toggled.connect(self._set_agent_mode)
+        self.addAction(self.act_agent_mode)
 
         # Acciones internas que se disparan desde el Host Key aunque el foco
         # esté temporalmente en la barra inferior.
@@ -333,6 +415,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self.act_zoom_reset)
         view_menu.addSeparator()
         view_menu.addAction(self.act_fullscreen)
+        view_menu.addSeparator()
+        view_menu.addAction(self.act_agent_mode)
+        view_menu.addAction(self.act_host_mode)
 
         tools_menu = bar.addMenu("&Herramientas")
         tools_menu.addAction(self.act_restart)
@@ -487,6 +572,8 @@ class MainWindow(QMainWindow):
         holder_layout.setSpacing(0)
         holder_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(holder)
+        # Aviso de cambios de modo, flotante y semitransparente sobre las terminales.
+        self._toast = ModeToast(holder)
 
     def _build_file_browser(self) -> None:
         self.file_dock = QDockWidget("Explorador", self)
@@ -713,10 +800,11 @@ class MainWindow(QMainWindow):
         workspace.panesChanged.connect(self._update_status)
         workspace.agentExited.connect(self._on_agent_exited)
         workspace.layoutChanged.connect(self._on_layout_changed)
-        workspace.hostKeyRequested.connect(self._enter_host_mode)
+        workspace.hostKeyRequested.connect(self._on_host_key)
         workspace.userFocusRequested.connect(self._exit_host_mode)
         workspace.directoryDropped.connect(self.assign_directory_to_pane)
         workspace.filesDropped.connect(self._on_files_dropped)
+        workspace.set_agent_mode(self._agent_mode)
         index = self.tabs.addTab(workspace, title)
         self.tabs.setCurrentIndex(index)
         return workspace
@@ -885,8 +973,51 @@ class MainWindow(QMainWindow):
 
     def _exit_host_mode(self, _pane) -> None:
         """El usuario hizo clic en una terminal: devolverle el teclado."""
+        if self._host_mode:
+            self._toast.show_message("Modo normal  ·  el teclado vuelve a la terminal")
         self._host_mode = False
         self._set_prompt_host_mode(False)
+        self._update_status()
+
+    def _on_host_key(self, _pane=None) -> None:
+        """Ctrl derecho: dentro de MODO RNCli se sale; si no, se alterna MODO AGENTE."""
+        if self._host_mode:
+            self._return_keyboard_to_terminal()
+            return
+        self._set_agent_mode(not self._agent_mode)
+
+    def _set_agent_mode(self, enabled: bool) -> None:
+        """MODO AGENTE: los atajos globales del chasis se apagan y todo va al agente."""
+        enabled = bool(enabled)
+        if enabled and self._host_mode:
+            self._exit_host_mode(None)
+        if enabled == self._agent_mode:
+            self.act_agent_mode.setChecked(enabled)
+            return
+        self._agent_mode = enabled
+        for action in self._shortcut_actions:
+            self._apply_shortcut(action)
+        for workspace in self._workspaces():
+            workspace.set_agent_mode(enabled)
+        self.act_agent_mode.setChecked(enabled)
+        hint = self._host_key_hint()
+        if enabled:
+            workspace = self.workspace()
+            if workspace is not None:
+                workspace.focus_terminal()
+            self._toast.show_message(
+                f"MODO AGENTE  ·  los atajos van al agente  ·  {hint} para volver"
+            )
+            self.statusBar().showMessage(
+                "MODO AGENTE: atajos globales apagados, todas las teclas van al "
+                f"agente. Pulsa {hint} para volver al comportamiento normal.",
+                8000,
+            )
+        else:
+            self._toast.show_message("Modo normal  ·  los atajos del chasis vuelven a estar activos")
+            self.statusBar().showMessage(
+                "Modo normal: los atajos del chasis vuelven a estar activos.", 5000
+            )
         self._update_status()
 
     def _return_keyboard_to_terminal(self) -> None:
@@ -898,11 +1029,16 @@ class MainWindow(QMainWindow):
             pane.terminal.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _enter_host_mode(self, pane) -> None:
-        """VirtualBox-style Host Key: libera el foco de la TUI."""
+        """MODO RNCli: libera el foco de la TUI y da el teclado al chasis."""
+        if self._agent_mode:
+            self._set_agent_mode(False)
         self._host_mode = True
         self._set_prompt_host_mode(True)
         self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
         hint = self._host_key_hint()
+        self._toast.show_message(
+            f"MODO RNCli  ·  teclado en el chasis  ·  {hint} para volver"
+        )
         self.statusBar().showMessage(
             "MODO RNCli: foco en el chasis (menús y atajos). "
             f"Haz clic en una terminal o pulsa {hint} para volver a escribir.",
@@ -1040,6 +1176,9 @@ class MainWindow(QMainWindow):
     def _update_prompt_hint(self) -> None:
         if self._host_mode:
             self.prompt_hint.setText(f"{self._host_key_hint()}  ·  salir")
+            return
+        if self._agent_mode:
+            self.prompt_hint.setText(f"{self._host_key_hint()}  ·  salir del modo agente")
             return
         workspace = self.workspace()
         pane = workspace.active_pane() if workspace else None
@@ -1206,6 +1345,8 @@ class MainWindow(QMainWindow):
             left = f"{pane.agent.emoji}  {pane.agent.name}  ·  {pane.shell_cwd()}  ·  {state}"
         if self._host_mode:
             left = f"MODO RNCli  ·  {left}"
+        if self._agent_mode:
+            left = f"MODO AGENTE  ·  atajos al agente  ·  {left}"
         self.status_left.setText(left)
         layout = LAYOUT_LABELS.get(workspace.layout_mode, workspace.layout_mode)
         extra = "  ·  difusión" if workspace.broadcast else ""

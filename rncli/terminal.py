@@ -199,6 +199,9 @@ class TerminalWidget(QWidget):
         self._engine = make_engine(80, 24, int(settings.scrollback))
         self._screen = self._engine.screen
         self._scroll_offset = 0
+        # MODO AGENTE (lo activa la ventana con la Host Key): los atajos fijos
+        # de la terminal también se apagan y todas las teclas van a la sesión.
+        self.agent_mode = False
         self._scrollbar: QScrollBar | None = None
         self._updating_scrollbar = False
         self._pending_dead_key: int | None = None
@@ -488,8 +491,8 @@ class TerminalWidget(QWidget):
         shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
         alt = bool(mods & Qt.KeyboardModifier.AltModifier)
 
-        # VirtualBox-style Host Key: no se envía al agente y devuelve el
-        # control al chasis de RNCli para que sus atajos funcionen.
+        # VirtualBox-style Host Key: no se envía al agente; alterna el MODO AGENTE
+        # (atajos del chasis apagados) o sale del MODO RNCli.
         if self._is_host_key(event):
             self.hostKeyPressed.emit()
             event.accept()
@@ -535,19 +538,20 @@ class TerminalWidget(QWidget):
                 if spaced:
                     self.session.write(spaced.encode("utf-8", "replace"))
 
-        # Atajos de la propia terminal
-        if ctrl and shift and key == Qt.Key.Key_C:
-            self.copy_selection()
-            return
-        if ctrl and shift and key == Qt.Key.Key_V:
-            self.paste()
-            return
-        if ctrl and shift and key == Qt.Key.Key_A:
-            self.select_all()
-            return
+        # Atajos de la propia terminal (apagados en MODO AGENTE: van al agente)
+        if not self.agent_mode:
+            if ctrl and shift and key == Qt.Key.Key_C:
+                self.copy_selection()
+                return
+            if ctrl and shift and key == Qt.Key.Key_V:
+                self.paste()
+                return
+            if ctrl and shift and key == Qt.Key.Key_A:
+                self.select_all()
+                return
 
         # Navegación por el historial con teclado (Shift+PageUp, Shift+PageDown, etc.)
-        if shift and not ctrl and not alt:
+        if shift and not ctrl and not alt and not self.agent_mode:
             page = max(1, self._screen.lines - 2)
             if key == Qt.Key.Key_PageUp:
                 self.scroll_by(page)

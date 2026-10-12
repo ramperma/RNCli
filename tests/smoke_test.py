@@ -805,15 +805,32 @@ def main() -> int:
     check(is_right_ctrl(FakeKey(284)), "Ctrl derecho detectado en Windows")
     check(not is_right_ctrl(FakeKey(29)), "Ctrl izquierdo no es la Host Key")
 
-    # La Host Key también funciona con el foco fuera de la terminal (barra, explorador)
+    # Con el foco fuera de la terminal, la Host Key alterna el MODO AGENTE
     window.settings = dataclasses.replace(config.settings, escape_key="host")
     window._host_mode = False
     window.prompt.setFocus(Qt.FocusReason.OtherFocusReason)
     wait(50)
     check(
-        window.eventFilter(window, esc_ev) is True and window._host_mode,
-        "la Host Key abre MODO RNCli aunque el foco no esté en la terminal",
+        window.eventFilter(window, esc_ev) is True and window._agent_mode,
+        "la Host Key entra en MODO AGENTE aunque el foco no esté en la terminal",
     )
+    check(
+        window._toast.isVisible() and "MODO AGENTE" in window._toast.text(),
+        "el cambio de modo muestra un aviso flotante semitransparente",
+    )
+    check(
+        window.act_new_tab.shortcut().isEmpty() and window.act_quit.shortcut().isEmpty(),
+        "en MODO AGENTE los atajos globales del chasis están apagados",
+    )
+    window._on_host_key()
+    check(not window._agent_mode, "la Host Key vuelve a sacar del MODO AGENTE")
+    check(
+        window.act_new_tab.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["new_tab"]),
+        "al salir del MODO AGENTE los atajos vuelven a su tabla",
+    )
+    # MODO RNCli: atajo propio, ya no la Host Key
+    window.act_host_mode.trigger()
+    check(window._host_mode, "Ctrl+Shift+Space (act_host_mode) abre MODO RNCli")
     window._return_keyboard_to_terminal()
     check(not window._host_mode, "la Host Key vuelve a devolver el teclado a la terminal")
     window.settings = config.settings
@@ -857,6 +874,29 @@ def main() -> int:
         check(
             bool(host_hits) and not any(chunk == b"\x1b" for chunk in recorded),
             "Escape como Host Key no se envía al agente",
+        )
+        check(window._agent_mode, "la Host Key en la terminal entra en MODO AGENTE")
+        check(
+            target.terminal.agent_mode and window.act_new_tab.shortcut().isEmpty(),
+            "en MODO AGENTE el terminal también suelta sus atajos fijos",
+        )
+        recorded.clear()
+        # Ctrl+Shift+C ya no copia: llega a la sesión como teclas del agente
+        target.terminal.keyPressEvent(
+            QKeyEvent(
+                QEvent.Type.KeyPress,
+                Qt.Key.Key_C,
+                Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier,
+            )
+        )
+        check(
+            any(chunk for chunk in recorded),
+            "en MODO AGENTE Ctrl+Shift+C se envía a la sesión",
+        )
+        window._on_host_key()
+        check(
+            not window._agent_mode and not target.terminal.agent_mode,
+            "la Host Key otra vez devuelve los atajos del chasis",
         )
         recorded.clear()
         # Acentos: tecla muerta aguda + vocal 'a' -> 'á'

@@ -67,6 +67,8 @@ class WorkspaceWidget(QWidget):
         self.title = "Sesión"
         self.layout_mode = settings.default_layout if settings.default_layout in LAYOUT_CAPS else "1"
         self.broadcast = False
+        # MODO AGENTE propagado desde la ventana: apaga los atajos fijos del terminal.
+        self.agent_mode = False
 
         self._panes: list[PaneWidget] = []
         self._active = 0
@@ -139,6 +141,8 @@ class WorkspaceWidget(QWidget):
         pane.userFocusRequested.connect(self._on_user_focus)
         pane.directoryDropped.connect(self._on_directory_drop)
         pane.filesDropped.connect(self._on_files_drop)
+        if pane.terminal is not None:
+            pane.terminal.agent_mode = self.agent_mode
         self._panes.append(pane)
         if focus:
             self._active = len(self._panes) - 1
@@ -413,6 +417,13 @@ class WorkspaceWidget(QWidget):
         self.broadcast = bool(enabled)
         for pane in self._panes:
             pane.set_broadcast(self.broadcast)
+
+    def set_agent_mode(self, enabled: bool) -> None:
+        """MODO AGENTE: los atajos fijos del terminal se apagan y todo va al agente."""
+        self.agent_mode = bool(enabled)
+        for pane in self._panes:
+            if pane.terminal is not None:
+                pane.terminal.agent_mode = self.agent_mode
 
     def on_terminal_input(self, pane: PaneWidget, data: bytes) -> None:
         """Lo que se teclea en un panel se replica en el resto si hay difusión."""

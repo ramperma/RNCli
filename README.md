@@ -138,7 +138,8 @@ herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas
 | `Ctrl+Shift+→` / `Ctrl+Shift+←` | Enfocar panel siguiente / anterior |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copiar / pegar |
 | **Tab** / **Shift+Tab** | Siempre al terminal seleccionado (cursor-agent, Pi…) |
-| **Ctrl derecho** | Host Key tipo VirtualBox: libera el foco (MODO RNCli: menús y barra) |
+| **Ctrl derecho** | Host Key: alterna el **MODO AGENTE** (atajos del chasis apagados; todas las teclas van al agente) |
+| `Ctrl+Shift+Space` | **MODO RNCli**: teclado para el chasis (menús, barra inferior, ratón) |
 | **Escape** | Configurable en Ajustes: al terminal o Host Key |
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
 | Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
@@ -156,7 +157,8 @@ Los atajos del chasis son **configurables** en `Ajustes → Atajos` (o editando 
 y teclas `F`, que los agentes no emplean, así que los atajos de RNCli funcionan **siempre**,
 también con una TUI enfocada. `Ctrl+letra` a secas queda libre para los agentes. Hay un
 preset **Clásico (RNCli antiguo)** con `Ctrl+T` / `Ctrl+W` / `Ctrl+Q`; ten en cuenta que
-esas teclas sí las usan los agentes, y con ese esquema necesitarás la Host Key para el chasis.
+esas teclas sí las usan los agentes, y con ese esquema necesitarás el MODO RNCli
+(`Ctrl+Shift+Space`) para que el chasis funcione dentro de una TUI.
 
 ## Instalación en el menú de aplicaciones
 
@@ -299,10 +301,16 @@ los agentes no emplean, así que funcionan **siempre**: con `Ctrl+Shift+T` se ab
 pestaña nueva aunque OpenCode tenga el foco. `Ctrl+letra` a secas queda 100% para el
 agente (`Ctrl+T` de OpenCode, `Ctrl+W` de bash…).
 
-Aun así existe el `MODO RNCli`: pulsa **Ctrl derecho** (o **Escape**, si lo activas en
-Ajustes → Tecla Escape) para quitar el foco de la TUI y manejar menús, barra inferior y
-explorador con el ratón. Haz clic en cualquier terminal o pulsa la Host Key otra vez para
-volver a escribir. Si tu escritorio no reporta el Ctrl derecho, ejecuta
+Si un agente quiere una tecla que coincide con un atajo del chasis, pulsa **Ctrl derecho**
+(o **Escape**, si lo activas en Ajustes → Tecla Escape) para entrar en el `MODO AGENTE`:
+los atajos globales de RNCli se **apagan** y todas las teclas, incluidas las que
+colisionan, llegan al agente. La barra de estado muestra `MODO AGENTE`. Pulsa la Host Key
+otra vez para recuperar los atajos del chasis.
+
+Para manejar menús, barra inferior y explorador con el teclado o el ratón existe el
+`MODO RNCli` (`Ctrl+Shift+Space`, configurable): quita el foco de la TUI y lo pone en la
+barra inferior. Haz clic en cualquier terminal o pulsa la Host Key para volver a escribir.
+Si tu escritorio no reporta el Ctrl derecho, ejecuta
 `tests/key_diag.py` y compara los códigos que imprime con los de `is_right_ctrl`.
 
 ### La pantalla «New session» de OpenCode
