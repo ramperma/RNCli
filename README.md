@@ -138,9 +138,9 @@ herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas
 | `Ctrl+Shift+→` / `Ctrl+Shift+←` | Enfocar panel siguiente / anterior |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copiar / pegar |
 | **Tab** / **Shift+Tab** | Siempre al terminal seleccionado (cursor-agent, Pi…) |
-| **Ctrl derecho** | Host Key: alterna el **MODO AGENTE** (atajos del chasis apagados; todas las teclas van al agente) |
+| **Host Key** (por defecto **Ctrl derecho**) | Alterna el **MODO AGENTE** (atajos del chasis apagados; todas las teclas van al agente). Se cambia en `Ajustes → Tecla Host` |
 | `Ctrl+Shift+Space` | **MODO RNCli**: teclado para el chasis (menús, barra inferior, ratón) |
-| **Escape** | Configurable en Ajustes: al terminal o Host Key |
+| **Escape** | Siempre al terminal seleccionado: la usan los agentes (vim, OpenCode, TUIs) y RNCli no la captura |
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
 | Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
 | Arrastrar con el ratón | Seleccionar texto (se ve incluso sobre TUIs con colores propios); con **Copiar al seleccionar** activo en Ajustes, se copia al soltar |
@@ -187,7 +187,7 @@ que copia la ruta al portapapeles). Formato:
       "env": { "GEMINI_API_KEY": "tu_clave_aquí" }
     }
   ],
-  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1", "escape_key": "terminal" },
+  "settings": { "theme": "oscuro", "font_size": 11, "default_layout": "1", "host_key": "right_ctrl" },
   "ssh_hosts": [
     {
       "name": "Producción",
@@ -225,8 +225,9 @@ Si aun así no lo encuentra, pon la ruta absoluta en el agente:
 ## Sesión y ajustes
 
 * **Ajustes**: fuente, tamaño, tema (Oscuro / Dracula / Claro / Grafito), líneas de historial,
-  diseño inicial, agente por defecto, carpeta inicial, tecla Escape (al terminal o Host Key),
-  cursor parpadeante y «recordar sesión al reiniciar» (pestañas, paneles, agentes y geometría).
+  diseño inicial, agente por defecto, carpeta inicial, **tecla Host** (Ctrl derecho, Bloq Mayús,
+  tecla Menú o ninguna), cursor parpadeante y «recordar sesión al reiniciar» (pestañas, paneles,
+  agentes y geometría).
 * Todo se guarda en `~/.config/rncli/`:
   `config.json` (ajustes y agentes) y `session.json` (pestañas y paneles; se restaura al abrir).
 * Si algo va mal, el registro de errores está en `~/.config/rncli/rncli.log`.
@@ -301,11 +302,16 @@ los agentes no emplean, así que funcionan **siempre**: con `Ctrl+Shift+T` se ab
 pestaña nueva aunque OpenCode tenga el foco. `Ctrl+letra` a secas queda 100% para el
 agente (`Ctrl+T` de OpenCode, `Ctrl+W` de bash…).
 
-Si un agente quiere una tecla que coincide con un atajo del chasis, pulsa **Ctrl derecho**
-(o **Escape**, si lo activas en Ajustes → Tecla Escape) para entrar en el `MODO AGENTE`:
-los atajos globales de RNCli se **apagan** y todas las teclas, incluidas las que
-colisionan, llegan al agente. La barra de estado muestra `MODO AGENTE`. Pulsa la Host Key
-otra vez para recuperar los atajos del chasis.
+Si un agente quiere una tecla que coincide con un atajo del chasis, pulsa la **Host Key**
+(**Ctrl derecho** por defecto) para entrar en el `MODO AGENTE`: los atajos globales de RNCli se
+**apagan** y todas las teclas, incluidas las que colisionan, llegan al agente. La barra de estado
+muestra `MODO AGENTE`. Pulsa la Host Key otra vez para recuperar los atajos del chasis.
+
+**Escape nunca es Host Key**: vim, OpenCode y casi cualquier TUI la usan a cada instante, así que
+siempre va al terminal seleccionado. La Host Key se elige en `Ajustes → Tecla Host`
+(Ctrl derecho, Bloq Mayús, tecla Menú o ninguna; con «ninguna» el MODO AGENTE se alterna desde
+el menú Ver). `Ctrl izquierdo` y `Alt derecha` no están en la lista porque sus pulsaciones
+aisladas interrumpirían `Ctrl+C`, `AltGr` y demás atajos del agente.
 
 Para manejar menús, barra inferior y explorador con el teclado o el ratón existe el
 `MODO RNCli` (`Ctrl+Shift+Space`, configurable): quita el foco de la TUI y lo pone en la

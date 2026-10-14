@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, __version__
 from .agents import Agent, pick_default_agent
 from .config import (
+    HOST_KEY_HINTS,
     LAYOUTS,
     Config,
     Settings,
@@ -71,8 +72,12 @@ class PromptBar(QLineEdit):
             self._normal_placeholder
         )
 
-    def set_host_mode(self, enabled: bool) -> None:
+    def set_host_mode(self, enabled: bool, hint: str = "Host Key") -> None:
         self.setProperty("hostMode", bool(enabled))
+        if enabled:
+            self._host_placeholder = (
+                f"MODO RNCli · atajos del chasis activos · {hint} para volver"
+            )
         self.setPlaceholderText(self._host_placeholder if enabled else self._normal_placeholder)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -218,9 +223,21 @@ class MainWindow(QMainWindow):
         return super().eventFilter(watched, event)
 
     def _host_key_hint(self) -> str:
-        if self.settings.escape_key == "host":
-            return "Ctrl derecho o Escape"
-        return "Ctrl derecho"
+        return HOST_KEY_HINTS.get(self.settings.host_key, "Ctrl derecho")
+
+    def _agent_mode_hint(self) -> str:
+        """Cómo volver del MODO AGENTE (los atajos del chasis están apagados ahí)."""
+        if self.settings.host_key == "none":
+            return "Ver → MODO AGENTE"
+        return self._host_key_hint()
+
+    def _agent_mode_tooltip(self) -> str:
+        """Texto del menú que explica cómo se alterna el MODO AGENTE."""
+        return (
+            "Apaga los atajos globales del chasis para que todas las teclas, "
+            f"incluidas las que colisionan, lleguen al agente. Se alterna con "
+            f"{self._agent_mode_hint()}."
+        )
 
     def _host_action(self, event) -> QAction | None:
         """Acción del chasis cuya secuencia coincide con la tecla pulsada."""
@@ -307,16 +324,13 @@ class MainWindow(QMainWindow):
             checkable=True,
         )
         self.act_host_mode = self._act(
-            "host_mode", "MODO RNCli (teclado al chasis)", lambda: self._enter_host_mode(None)
+            "host_mode", "MODO RNCli (teclado al chasis)", self._toggle_host_mode
         )
         # MODO AGENTE se alterna con la Host Key (Ctrl derecho); sin atajo en la
         # tabla porque en ese modo los atajos del chasis están apagados.
         self.act_agent_mode = QAction("MODO AGENTE (atajos al agente)", self)
         self.act_agent_mode.setCheckable(True)
-        self.act_agent_mode.setToolTip(
-            "Apaga los atajos globales del chasis para que todas las teclas, "
-            "incluidas las que colisionan, lleguen al agente. Se alterna con Ctrl derecho."
-        )
+        self.act_agent_mode.setToolTip(self._agent_mode_tooltip())
         self.act_agent_mode.toggled.connect(self._set_agent_mode)
         self.addAction(self.act_agent_mode)
 
@@ -1000,7 +1014,7 @@ class MainWindow(QMainWindow):
         for workspace in self._workspaces():
             workspace.set_agent_mode(enabled)
         self.act_agent_mode.setChecked(enabled)
-        hint = self._host_key_hint()
+        hint = self._agent_mode_hint()
         if enabled:
             workspace = self.workspace()
             if workspace is not None:
@@ -1019,6 +1033,13 @@ class MainWindow(QMainWindow):
                 "Modo normal: los atajos del chasis vuelven a estar activos.", 5000
             )
         self._update_status()
+
+    def _toggle_host_mode(self) -> None:
+        """Ctrl+Shift+Space: entra en MODO RNCli; otra vez, devuelve el teclado a la terminal."""
+        if self._host_mode:
+            self._return_keyboard_to_terminal()
+        else:
+            self._enter_host_mode(None)
 
     def _return_keyboard_to_terminal(self) -> None:
         """Host Key otra vez: sale de MODO RNCli y escribe en el panel seleccionado."""
@@ -1158,7 +1179,7 @@ class MainWindow(QMainWindow):
         self.prompt.setFocus(Qt.FocusReason.ShortcutFocusReason)
 
     def _set_prompt_host_mode(self, enabled: bool) -> None:
-        self.prompt.set_host_mode(enabled)
+        self.prompt.set_host_mode(enabled, self._host_key_hint())
         self.prompt_container.setProperty("hostMode", bool(enabled))
         self.prompt_container.style().unpolish(self.prompt_container)
         self.prompt_container.style().polish(self.prompt_container)
@@ -1178,7 +1199,7 @@ class MainWindow(QMainWindow):
             self.prompt_hint.setText(f"{self._host_key_hint()}  ·  salir")
             return
         if self._agent_mode:
-            self.prompt_hint.setText(f"{self._host_key_hint()}  ·  salir del modo agente")
+            self.prompt_hint.setText(f"{self._agent_mode_hint()}  ·  salir del modo agente")
             return
         workspace = self.workspace()
         pane = workspace.active_pane() if workspace else None
@@ -1219,6 +1240,7 @@ class MainWindow(QMainWindow):
         self._restore_session = True
         self.apply_theme()
         self._apply_settings_to_workspaces()
+        self.act_agent_mode.setToolTip(self._agent_mode_tooltip())
         self.file_browser.set_show_hidden(self.settings.show_hidden_files)
         self.toolbar.setVisible(self.settings.show_toolbar)
         self._update_status()

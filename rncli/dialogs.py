@@ -41,8 +41,8 @@ from PySide6.QtWidgets import (
 from . import APP_NAME, __version__
 from .agents import Agent, KNOWN_AGENTS, catalog_agents, pick_default_agent
 from .config import (
-    ESCAPE_KEY_LABELS,
-    ESCAPE_KEY_MODES,
+    HOST_KEY_LABELS,
+    HOST_KEY_MODES,
     LAYOUTS,
     SHORTCUT_CLASSIC,
     SHORTCUT_DEFAULTS,
@@ -926,15 +926,18 @@ class SettingsDialog(QDialog):
         form.addRow("Agente por defecto", agent_box)
         form.addRow("Carpeta inicial", dir_box)
 
-        self.escape_combo = QComboBox()
-        for key in ESCAPE_KEY_MODES:
-            self.escape_combo.addItem(ESCAPE_KEY_LABELS[key], key)
-        self.escape_combo.setCurrentIndex(max(0, self.escape_combo.findData(settings.escape_key)))
-        self.escape_combo.setToolTip(
-            "Tab y el resto de teclas van siempre al terminal seleccionado.\n"
-            "Escape puede ir al agente o usarse como Host Key (igual que Ctrl derecho)."
+        self.host_combo = QComboBox()
+        for key in HOST_KEY_MODES:
+            self.host_combo.addItem(HOST_KEY_LABELS[key], key)
+        self.host_combo.setCurrentIndex(max(0, self.host_combo.findData(settings.host_key)))
+        self.host_combo.setToolTip(
+            "La Host Key libera el teclado del agente y alterna el MODO AGENTE.\n"
+            "Escape nunca es Host Key: los agentes (vim, OpenCode, TUIs) la usan y "
+            "siempre va al terminal seleccionado.\n"
+            "Ctrl izquierdo y Alt derecha no están en la lista porque sus pulsaciones "
+            "aisladas interrumpirían Ctrl+C, AltGr y demás atajos del agente."
         )
-        form.addRow("Tecla Escape", self.escape_combo)
+        form.addRow("Tecla Host", self.host_combo)
 
         box = QGroupBox("Comportamiento")
         box_layout = QVBoxLayout(box)
@@ -1104,7 +1107,7 @@ class SettingsDialog(QDialog):
             copy_on_select=self.copy_check.isChecked(),
             bell_flash=base.bell_flash,
             start_dir=self.start_dir_edit.text().strip() or os.path.expanduser("~"),
-            escape_key=str(self.escape_combo.currentData() or "terminal"),
+            host_key=str(self.host_combo.currentData() or "right_ctrl"),
             show_hidden_files=self.hidden_check.isChecked(),
             show_toolbar=self.toolbar_check.isChecked(),
             shortcuts=self._result_shortcuts(),
@@ -1119,9 +1122,10 @@ class ShortcutsDialog(QDialog):
         ("Terminal", None),
         ("Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+A", "Copiar / pegar / seleccionar todo (apagados en MODO AGENTE)"),
         ("Tab / Shift+Tab", "Siempre al terminal seleccionado (cursor-agent, Pi…)"),
-        ("Ctrl derecho", "Host Key: alterna el MODO AGENTE (atajos del chasis apagados, "
-         "todas las teclas al agente); en MODO RNCli, sale de él"),
-        ("Escape", "Configurable en Ajustes: al terminal o Host Key de RNCli"),
+        ("Host Key (por defecto Ctrl derecho)", "Alterna el MODO AGENTE (atajos del chasis "
+         "apagados, todas las teclas al agente); en MODO RNCli, sale de él. Se cambia en "
+         "Ajustes → Tecla Host"),
+        ("Escape", "Siempre al terminal seleccionado: los agentes y TUIs la usan (vim, OpenCode…)"),
         ("Shift+PageUp / Shift+PageDown", "Desplazarse por el historial (apagado en MODO AGENTE)"),
         ("Rueda del ratón", "Desplaza la TUI si pide el ratón (OpenCode); si no, el historial"),
         ("Shift + rueda", "Historial de la terminal aunque la TUI use el ratón"),

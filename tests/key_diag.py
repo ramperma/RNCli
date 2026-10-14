@@ -1,8 +1,9 @@
 """Diagnóstico de teclas: imprime lo que Qt recibe de verdad.
 
-Útil cuando la Host Key (Ctrl derecho) no entra en MODO RNCli: pulsa la tecla
-y compara los códigos que imprime este script con los que reconoce
-rncli.terminal.is_right_ctrl (X11 105, evdev/Wayland 97, Windows 284).
+Útil cuando la Host Key (Ctrl derecho, Bloq Mayús o tecla Menú) no entra en
+MODO AGENTE / MODO RNCli: pulsa la tecla y compara los códigos que imprime este
+script con los que reconoce rncli.terminal.is_right_ctrl
+(X11 105, evdev/Wayland 97, Windows 284).
 
 Ejecución:  QT_QPA_PLATFORM=xcb .venv/bin/python tests/key_diag.py
 """
@@ -23,7 +24,8 @@ class DiagWindow(QWidget):
         self.setWindowTitle("RNCli · diagnóstico de teclas (cierra con Ctrl+C o la X)")
         self.resize(560, 320)
         self._info = QLabel(
-            "Pulsa teclas aquí, sobre todo Ctrl derecho, Ctrl izquierdo y Escape.\n"
+            "Pulsa teclas aquí, sobre todo Ctrl derecho, Ctrl izquierdo, Bloq Mayús, "
+            "tecla Menú y Escape.\n"
             "Ctrl+Q sale.\n"
             "Espera: Ctrl+Q es el atajo clásico; aquí solo cierra con la X."
         )

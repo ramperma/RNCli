@@ -16,10 +16,22 @@ SESSION_PATH = CONFIG_DIR / "session.json"
 LOG_PATH = CONFIG_DIR / "rncli.log"
 
 LAYOUTS = ["1", "2v", "2h", "4", "6", "all"]
-ESCAPE_KEY_MODES = ["terminal", "host"]
-ESCAPE_KEY_LABELS = {
-    "terminal": "Al terminal seleccionado (agentes, vim…)",
-    "host": "Host Key de RNCli (como Ctrl derecho)",
+
+# Tecla Host Key (la que libera el teclado hacia el chasis). Escape NO es una
+# opción: vim, OpenCode y casi cualquier TUI la usan, y si RNCli la captura el
+# agente se queda sin ella. Las alternativas son teclas que los agentes no usan.
+HOST_KEY_MODES = ["right_ctrl", "caps_lock", "menu", "none"]
+HOST_KEY_LABELS = {
+    "right_ctrl": "Ctrl derecho (por defecto)",
+    "caps_lock": "Bloq Mayús",
+    "menu": "Tecla Menú (Applications / Compose)",
+    "none": "Ninguna (solo MODO RNCli con Ctrl+Shift+Space)",
+}
+HOST_KEY_HINTS = {
+    "right_ctrl": "Ctrl derecho",
+    "caps_lock": "Bloq Mayús",
+    "menu": "tecla Menú",
+    "none": "Ctrl+Shift+Space",
 }
 
 # ---------------------------------------------------------------- atajos chasis
@@ -139,7 +151,7 @@ class Settings:
     copy_on_select: bool = False
     bell_flash: bool = True
     start_dir: str = str(Path.home())
-    escape_key: str = "terminal"       # terminal | host
+    host_key: str = "right_ctrl"       # right_ctrl | caps_lock | menu | none
     show_hidden_files: bool = False
     show_toolbar: bool = True
     shortcuts: dict = field(default_factory=lambda: dict(SHORTCUT_DEFAULTS))
@@ -179,8 +191,8 @@ class Settings:
             clean["default_layout"] = "1"
         if clean.get("theme") not in {"oscuro", "dracula", "claro", "modern_dark"}:
             clean["theme"] = "oscuro"
-        if clean.get("escape_key") not in ESCAPE_KEY_MODES:
-            clean["escape_key"] = "terminal"
+        if clean.get("host_key") not in HOST_KEY_MODES:
+            clean["host_key"] = "right_ctrl"
         if "shortcuts" in clean:
             clean["shortcuts"] = {**SHORTCUT_DEFAULTS, **clean["shortcuts"]}
         return cls(**clean)
@@ -210,11 +222,18 @@ class Config:
         ssh_hosts = [
             SshHost.from_dict(item) for item in data.get("ssh_hosts", []) if isinstance(item, dict)
         ]
-        return cls(
+        config = cls(
             agents=agents,
             settings=Settings.from_dict(data.get("settings", {})),
             ssh_hosts=ssh_hosts,
         )
+        # Migración: «escape_key» era la opción con la que Escape actuaba como
+        # Host Key. Ya no existe (los agentes la necesitan), así que se limpia del
+        # config.json para que no confunda al editarlo a mano.
+        legacy = data.get("settings")
+        if isinstance(legacy, dict) and "escape_key" in legacy:
+            config.save()
+        return config
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)

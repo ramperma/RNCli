@@ -599,13 +599,22 @@ def main() -> int:
 
     from PySide6.QtCore import QEvent, Qt
     from PySide6.QtGui import QKeyEvent
+
+    from rncli.config import HOST_KEY_MODES
     from rncli.terminal import is_host_key, tab_sequence
 
     settings_ui = SettingsDialog(config.settings, config.agents, window)
-    check(settings_ui.escape_combo.count() == 2, "ajustes permite configurar la tecla Escape")
-    settings_ui.escape_combo.setCurrentIndex(max(0, settings_ui.escape_combo.findData("host")))
+    check(
+        settings_ui.host_combo.count() == len(HOST_KEY_MODES),
+        "ajustes permite elegir la tecla Host",
+    )
+    check(
+        "escape" not in " ".join(HOST_KEY_MODES).lower(),
+        "Escape no puede ser Host Key: la usan los agentes",
+    )
+    settings_ui.host_combo.setCurrentIndex(max(0, settings_ui.host_combo.findData("caps_lock")))
     escaped = settings_ui.result_settings(config.settings)
-    check(escaped.escape_key == "host", "ajustes guarda Escape como Host Key")
+    check(escaped.host_key == "caps_lock", "ajustes guarda la tecla Host elegida")
     settings_ui.hidden_check.setChecked(True)
     escaped = settings_ui.result_settings(config.settings)
     check(escaped.show_hidden_files is True, "ajustes guarda mostrar archivos ocultos")
@@ -616,10 +625,15 @@ def main() -> int:
 
     from rncli.config import Settings as SettingsCls
 
-    check(SettingsCls.from_dict({"escape_key": "host"}).escape_key == "host", "config.json acepta escape_key=host")
+    check(SettingsCls.from_dict({}).host_key == "right_ctrl", "la Host Key por defecto es Ctrl derecho")
+    check(SettingsCls.from_dict({"host_key": "menu"}).host_key == "menu", "config.json acepta host_key=menu")
     check(
-        SettingsCls.from_dict({"escape_key": "espacio"}).escape_key == "terminal",
-        "escape_key inválida usa el terminal",
+        SettingsCls.from_dict({"host_key": "espacio"}).host_key == "right_ctrl",
+        "host_key inválida vuelve a Ctrl derecho",
+    )
+    check(
+        SettingsCls.from_dict({"escape_key": "host"}).host_key == "right_ctrl",
+        "escape_key queda fuera de los ajustes (config antiguas arrancan normal)",
     )
     check(
         SettingsCls.from_dict({}).show_hidden_files is False,
@@ -724,10 +738,12 @@ def main() -> int:
     check(tab_sequence(ctrl_tab_ev) is None, "Ctrl+Tab no se envía al agente")
 
     esc_ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
-    host_settings = dataclasses.replace(config.settings, escape_key="host")
-    term_settings = dataclasses.replace(config.settings, escape_key="terminal")
-    check(is_host_key(esc_ev, host_settings), "Escape configurado es Host Key")
-    check(not is_host_key(esc_ev, term_settings), "Escape por defecto va al terminal")
+    caps_ev = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_CapsLock, Qt.KeyboardModifier.NoModifier)
+    caps_settings = dataclasses.replace(config.settings, host_key="caps_lock")
+    check(not is_host_key(esc_ev, config.settings), "Escape no es Host Key por defecto")
+    check(not is_host_key(esc_ev, caps_settings), "Escape nunca es Host Key, ni configurada")
+    check(is_host_key(caps_ev, caps_settings), "Bloq Mayús como Host Key configurable")
+    check(not is_host_key(caps_ev, config.settings), "Bloq Mayús no es Host Key por defecto")
 
     # --- Atajos del chasis: tabla única configurable (config.SHORTCUT_DEFAULTS) ---
     from PySide6.QtGui import QKeySequence
@@ -791,6 +807,9 @@ def main() -> int:
         def __init__(self, scan: int) -> None:
             self._scan = scan
 
+        def type(self):
+            return QEvent.Type.KeyPress
+
         def key(self):
             return Qt.Key.Key_Control
 
@@ -800,19 +819,32 @@ def main() -> int:
         def nativeVirtualKey(self) -> int:
             return 0
 
+        def accept(self) -> None:
+            pass
+
+        def ignore(self) -> None:
+            pass
+
     check(is_right_ctrl(FakeKey(105)), "Ctrl derecho detectado en X11")
     check(is_right_ctrl(FakeKey(97)), "Ctrl derecho detectado en Wayland")
     check(is_right_ctrl(FakeKey(284)), "Ctrl derecho detectado en Windows")
     check(not is_right_ctrl(FakeKey(29)), "Ctrl izquierdo no es la Host Key")
+    check(
+        not is_host_key(FakeKey(105), dataclasses.replace(config.settings, host_key="none")),
+        "host_key=none deja todas las teclas en el agente",
+    )
 
     # Con el foco fuera de la terminal, la Host Key alterna el MODO AGENTE
-    window.settings = dataclasses.replace(config.settings, escape_key="host")
     window._host_mode = False
     window.prompt.setFocus(Qt.FocusReason.OtherFocusReason)
     wait(50)
     check(
-        window.eventFilter(window, esc_ev) is True and window._agent_mode,
-        "la Host Key entra en MODO AGENTE aunque el foco no esté en la terminal",
+        window.eventFilter(window, FakeKey(105)) is True and window._agent_mode,
+        "Ctrl derecho entra en MODO AGENTE aunque el foco no esté en la terminal",
+    )
+    check(
+        window.eventFilter(window, esc_ev) is False and window._agent_mode,
+        "Escape no alterna el MODO AGENTE: sigue siendo tecla del agente",
     )
     check(
         window._toast.isVisible() and "MODO AGENTE" in window._toast.text(),
@@ -828,9 +860,11 @@ def main() -> int:
         window.act_new_tab.shortcut() == QKeySequence(SHORTCUT_DEFAULTS["new_tab"]),
         "al salir del MODO AGENTE los atajos vuelven a su tabla",
     )
-    # MODO RNCli: atajo propio, ya no la Host Key
+    # MODO RNCli: atajo propio que entra y sale (no depende de la Host Key)
     window.act_host_mode.trigger()
     check(window._host_mode, "Ctrl+Shift+Space (act_host_mode) abre MODO RNCli")
+    window.act_host_mode.trigger()
+    check(not window._host_mode, "Ctrl+Shift+Space otra vez devuelve el teclado a la terminal")
     window._return_keyboard_to_terminal()
     check(not window._host_mode, "la Host Key vuelve a devolver el teclado a la terminal")
     window.settings = config.settings
@@ -838,7 +872,7 @@ def main() -> int:
     target = workspace.add_pane(shell, "/tmp")
     wait(200)
     if target is not None and target.terminal is not None and target.session is not None:
-        target.terminal.settings = term_settings
+        target.terminal.settings = config.settings
         target.terminal.setFocus(Qt.FocusReason.OtherFocusReason)
         wait(50)
         recorded: list[bytes] = []
@@ -863,17 +897,27 @@ def main() -> int:
             "Tab no cambia el foco a otro widget",
         )
         recorded.clear()
-        host_hits: list[bool] = []
-        target.terminal.settings = host_settings
-        target.terminal.hostKeyPressed.connect(lambda: host_hits.append(True))
         QApplication.sendEvent(
             target.terminal,
             QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier),
         )
         wait(40)
         check(
-            bool(host_hits) and not any(chunk == b"\x1b" for chunk in recorded),
-            "Escape como Host Key no se envía al agente",
+            any(chunk == b"\x1b" for chunk in recorded) and not window._agent_mode,
+            "Escape llega al agente y no activa el MODO AGENTE",
+        )
+        recorded.clear()
+        host_hits: list[bool] = []
+        target.terminal.settings = caps_settings
+        target.terminal.hostKeyPressed.connect(lambda: host_hits.append(True))
+        QApplication.sendEvent(
+            target.terminal,
+            QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_CapsLock, Qt.KeyboardModifier.NoModifier),
+        )
+        wait(40)
+        check(
+            bool(host_hits) and not any(chunk for chunk in recorded),
+            "la Host Key configurable no se envía al agente",
         )
         check(window._agent_mode, "la Host Key en la terminal entra en MODO AGENTE")
         check(
@@ -925,7 +969,8 @@ def main() -> int:
     else:
         check(False, "Tab llega al terminal seleccionado")
         check(False, "Tab no cambia el foco a otro widget")
-        check(False, "Escape como Host Key no se envía al agente")
+        check(False, "Escape llega al agente y no activa el MODO AGENTE")
+        check(False, "la Host Key configurable no se envía al agente")
 
     from PySide6.QtCore import QDir, QMimeData, QPoint, QPointF, QUrl, Qt
     from PySide6.QtGui import QDragEnterEvent, QDropEvent

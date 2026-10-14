@@ -104,13 +104,12 @@ def capability_replies(data: bytes) -> bytes:
         return XTVERSION_REPLY
     return b""
 
-# Modificadores que no deben acompañar a Tab ni a Escape-como-Host-Key.
+# Modificadores que no deben acompañar a Tab: Ctrl/Alt/Meta se los queda RNCli.
 _NAV_MODS = (
     Qt.KeyboardModifier.ControlModifier
     | Qt.KeyboardModifier.AltModifier
     | Qt.KeyboardModifier.MetaModifier
 )
-_HOST_MODS = _NAV_MODS | Qt.KeyboardModifier.ShiftModifier
 
 
 def is_right_ctrl(event) -> bool:
@@ -127,12 +126,20 @@ def is_right_ctrl(event) -> bool:
 
 
 def is_host_key(event, settings) -> bool:
-    """True si la tecla libera el teclado hacia RNCli y no debe ir al agente."""
-    if is_right_ctrl(event):
-        return True
-    if getattr(settings, "escape_key", "terminal") != "host":
+    """True si la tecla libera el teclado hacia RNCli y no debe ir al agente.
+
+    Escape nunca es Host Key: los agentes (vim, OpenCode, TUIs) la usan a cada
+    instante y debe llegar siempre a la sesión. La tecla se elige en
+    Ajustes → Tecla Host; por defecto Ctrl derecho, tipo VirtualBox.
+    """
+    mode = getattr(settings, "host_key", "right_ctrl")
+    if mode == "caps_lock":
+        return event.key() == Qt.Key.Key_CapsLock
+    if mode == "menu":
+        return event.key() == Qt.Key.Key_Menu
+    if mode == "none":
         return False
-    return event.key() == Qt.Key.Key_Escape and not bool(event.modifiers() & _HOST_MODS)
+    return is_right_ctrl(event)
 
 
 def tab_sequence(event) -> bytes | None:
@@ -498,12 +505,15 @@ class TerminalWidget(QWidget):
             event.accept()
             return
 
-        # Teclas modificadoras solas no cancelan el scroll ni se envían a la sesión
+        # Teclas modificadoras o bloqueadoras solas no cancelan el scroll ni se
+        # envían a la sesión (Caps Lock y Menú solo valen como Host Key).
         if key in (
             Qt.Key.Key_Shift,
             Qt.Key.Key_Control,
             Qt.Key.Key_Alt,
             Qt.Key.Key_Meta,
+            Qt.Key.Key_CapsLock,
+            Qt.Key.Key_Menu,
         ):
             return
 
