@@ -21,7 +21,12 @@ fi
 # Motor nativo opcional (PTY + VT). Si no hay Rust o falla la compilación, se usa pyte.
 if [ -x "$HOME/.cargo/bin/cargo" ] || command -v cargo >/dev/null 2>&1; then
   export PATH="${HOME}/.cargo/bin:${PATH}"
-  if ! "$VENV/bin/python" -c "import rncli_native" >/dev/null 2>&1; then
+  NATIVE_SO="$("$VENV/bin/python" -c "import pathlib, rncli_native; print(next(iter(pathlib.Path(rncli_native.__file__).parent.glob('*.so')), ''))" 2>/dev/null || true)"
+  NEED_BUILD=1
+  if [ -n "$NATIVE_SO" ] && [ -z "$(find "$ROOT/native/src" "$ROOT/native/Cargo.toml" -newer "$NATIVE_SO" -print -quit 2>/dev/null)" ]; then
+    NEED_BUILD=0
+  fi
+  if [ "$NEED_BUILD" = "1" ]; then
     echo "[rncli] compilando motor nativo (Rust)..."
     if "$VENV/bin/python" -m pip install -q maturin \
       && (cd "$ROOT/native" && VIRTUAL_ENV="$VENV" "$VENV/bin/python" -m maturin develop --release); then

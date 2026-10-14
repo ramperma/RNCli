@@ -9,7 +9,15 @@ import shlex
 import unicodedata
 
 from PySide6.QtCore import QEvent, QPointF, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QInputMethodEvent, QPainter, QPalette
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetricsF,
+    QInputMethodEvent,
+    QPainter,
+    QPalette,
+    QPixmap,
+)
 from PySide6.QtWidgets import QApplication, QScrollBar, QWidget
 
 from .theme import brighten, resolve_color, theme
@@ -184,6 +192,55 @@ def quote_drop_paths(paths: list[str]) -> str:
     return " ".join(shlex.quote(path) for path in paths if path)
 
 
+class GlyphAtlas:
+    """Caché de glifos ya rasterizados: un drawPixmap por celda en vez de drawText.
+
+    QPainter.drawText con recorte por celda (lo que hace un terminal «clásico»)
+    es de 4 a 6 veces más lento que copiar un mapa de bits: cada llamada vuelve a
+    maquetar el glifo. Aquí cada (carácter, estilo, color) se rasteriza una sola
+    vez en una celda del tamaño exacto y luego solo se copia. El resultado es
+    idéntico (mismo tipo de letra, misma línea base, mismo recorte) porque la
+    celda pequeña ya hace de recorte.
+    """
+
+    MAX_ENTRIES = 2000
+
+    def __init__(self, widget: "TerminalWidget") -> None:
+        self._widget = widget
+        self._cache: dict[tuple, QPixmap] = {}
+        self._dpr = 0.0
+        self._cell = (0, 0)
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def pixmap(self, glyph: str, font: QFont, color: QColor, style: int) -> QPixmap:
+        dpr = self._widget.devicePixelRatioF() or 1.0
+        cell = (max(1, int(self._widget._cell_w)), max(1, int(self._widget._cell_h)))
+        if dpr != self._dpr or cell != self._cell:
+            # Otra densidad de pantalla u otro tamaño de celda: lo cacheado no vale.
+            self._cache.clear()
+            self._dpr, self._cell = dpr, cell
+        key = (glyph, style, color.rgba())
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        pixmap = QPixmap(int(cell[0] * dpr), int(cell[1] * dpr))
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        painter.setFont(font)
+        painter.setPen(color)
+        painter.drawText(QPointF(0, self._widget._ascent), glyph)
+        painter.end()
+        if len(self._cache) >= self.MAX_ENTRIES:
+            self._cache.clear()
+        self._cache[key] = pixmap
+        return pixmap
+
+
 class TerminalWidget(QWidget):
     """Terminal con scrollback, selección, copiar/pegar y aviso de campana."""
 
@@ -216,6 +273,14 @@ class TerminalWidget(QWidget):
         self._last_title = ""
         self._bell_pending = False
         self._raw_tail = b""
+        # Caché de pintado: glifos rasterizados y filas del motor ya convertidas.
+        # Se invalidan por daño (motor), cambio de tamaño o recorte del historial.
+        self._atlas = GlyphAtlas(self)
+        self._row_cache: dict[int, list] = {}
+        self._row_cache_cap = 0
+        self._history_watermark = 0
+        self._cursor_mark: tuple[int, int, bool] | None = None
+        self._scrollbar_state: tuple[int, int, int] | None = None
 
         self._sel_anchor: tuple[int, int] | None = None
         self._sel_focus: tuple[int, int] | None = None
@@ -286,6 +351,8 @@ class TerminalWidget(QWidget):
         self._cell_w = float(max(1, math.ceil(metrics.horizontalAdvance("M"))))
         self._cell_h = float(max(1, math.ceil(metrics.height())))
         self._ascent = metrics.ascent()
+        self._atlas.clear()
+        self._row_cache_cap = max(64, 3 * int(self._engine.lines()))
         # Las TUI modernas (OpenCode/OpenTUI) preguntan el tamaño en píxeles.
         setter = getattr(self._engine, "set_cell_size", None)
         if callable(setter):
@@ -306,6 +373,7 @@ class TerminalWidget(QWidget):
         self._selection_color = QColor(self._palette["selection"])
         self._fg_cache.clear()
         self._bg_cache.clear()
+        self._atlas.clear()
         self._apply_palette()
         self.update()
 
@@ -323,6 +391,9 @@ class TerminalWidget(QWidget):
             self._engine.resize(cols, rows)
             self.session.resize(cols, rows)
             self._scroll_offset = min(self._scroll_offset, self._history_len())
+            # El reflujo cambia las filas: la caché de pintado ya no vale.
+            self._row_cache.clear()
+            self._row_cache_cap = max(64, 3 * int(rows))
             self._sync_scrollbar()
             self.sizeChanged.emit(cols, rows)
             self.update()
@@ -443,10 +514,77 @@ class TerminalWidget(QWidget):
             self._last_title = title
             self.titleChanged.emit(title)
 
-        if self.isVisible():
-            self._schedule_repaint()
-        else:
-            self._screen.dirty.clear()
+        self._apply_damage()
+
+    def _apply_damage(self) -> None:
+        """Invalida solo las filas que el motor marcó como cambiadas y las repinta.
+
+        El motor entrega el daño por línea del viewport (o «pantalla entera» tras
+        un scroll). Así, mientras un agente escupe tokens, se repintan una o dos
+        filas en vez de las ~45 de la pantalla completa.
+        """
+        history = self._history_len()
+        if history < self._history_watermark:
+            # El scrollback se recortó: los índices absolutos ya no valen.
+            self._row_cache.clear()
+        self._history_watermark = history
+
+        take = getattr(self._engine, "take_damage", None)
+        damage = take() if callable(take) else None
+        if damage is None:
+            self._row_cache.clear()
+            if self.isVisible():
+                self.update()
+            return
+
+        visible = self.isVisible()
+        base = history - self._scroll_offset
+        lines = self._screen.lines
+        columns = self._screen.columns
+        cell_w = max(1, int(self._cell_w))
+        cell_h = max(1, int(self._cell_h))
+
+        touched: dict[int, tuple[int, int]] = {}
+        for line, left, right in damage:
+            row = history + int(line)
+            self._row_cache.pop(row, None)
+            if not visible or row < base or row >= base + lines:
+                continue
+            left = max(0, min(columns - 1, int(left)))
+            right = max(left, min(columns - 1, int(right)))
+            previous = touched.get(row)
+            if previous is None:
+                touched[row] = (left, right)
+            else:
+                touched[row] = (min(left, previous[0]), max(right, previous[1]))
+
+        if not self._engine.native:
+            # pyte no marca el cursor al moverse: si cambió de celda, hay que
+            # repintar la celda vieja y la nueva.
+            cursor = self._screen.cursor
+            mark = (int(cursor.x), int(cursor.y), bool(cursor.hidden))
+            if mark != self._cursor_mark:
+                previous, self._cursor_mark = self._cursor_mark, mark
+                for _x, y, _hidden in (mark, previous or (0, -1, True)):
+                    if not (0 <= y < lines):
+                        continue
+                    row = base + y
+                    self._row_cache.pop(row, None)
+                    if visible and base <= row < base + lines:
+                        touched[row] = (0, columns - 1)
+
+        if visible and touched:
+            pending: QRect | None = None
+            for row, (left, right) in touched.items():
+                chunk = QRect(
+                    int(PAD_X + left * cell_w),
+                    int(PAD_Y + (row - base) * cell_h),
+                    (right - left + 1) * cell_w,
+                    cell_h,
+                )
+                pending = chunk if pending is None else pending.united(chunk)
+            if pending is not None:
+                self.update(pending)
 
     def feed_text(self, text: str) -> None:
         """Escribe texto generado por la propia aplicación en el búfer."""
@@ -460,10 +598,6 @@ class TerminalWidget(QWidget):
         except OSError:
             return
 
-    def _schedule_repaint(self) -> None:
-        self._screen.dirty.clear()
-        self.update()
-
     def _emit_bell(self) -> None:
         self.bell.emit()
 
@@ -471,7 +605,22 @@ class TerminalWidget(QWidget):
         if not self.hasFocus() or self._scroll_offset > 0:
             return
         self._cursor_on = not self._cursor_on
-        self.update()
+        rect = self._cursor_rect()
+        if rect is not None:
+            # Parpadear no cambia el contenido: basta con repintar la celda.
+            self.update(rect)
+
+    def _cursor_rect(self) -> QRect | None:
+        """Celda exacta del cursor, para repintados parciales (parpadeo)."""
+        if self._screen.cursor.hidden or self._scroll_offset != 0:
+            return None
+        x = int(self._screen.cursor.x)
+        y = int(self._screen.cursor.y)
+        if not (0 <= x < self._screen.columns and 0 <= y < self._screen.lines):
+            return None
+        cell_w = max(1, int(self._cell_w))
+        cell_h = max(1, int(self._cell_h))
+        return QRect(int(PAD_X + x * cell_w), int(PAD_Y + y * cell_h), cell_w, cell_h)
 
     # ------------------------------------------------------------------ teclado
     def _is_host_key(self, event) -> bool:
@@ -842,6 +991,10 @@ class TerminalWidget(QWidget):
             return
         limit = self._history_len()
         lines = max(1, self._screen.lines)
+        state = (limit, lines, self._scroll_offset)
+        if state == self._scrollbar_state:
+            return
+        self._scrollbar_state = state
         self._updating_scrollbar = True
         try:
             self._scrollbar.setRange(0, limit)
@@ -947,6 +1100,21 @@ class TerminalWidget(QWidget):
         """Fila (histórica o viva) como lista de Char, una por columna."""
         return self._engine.row(abs_row)
 
+    def _row_for_paint(self, abs_row: int) -> list:
+        """Fila para pintar, reutilizando lo ya convertido si sigue valiendo.
+
+        La caché se invalida por daño del motor (solo las filas tocadas), así que
+        un repintado no vuelve a pedir 45 filas al motor por 2 que cambiaron.
+        """
+        cached = self._row_cache.get(abs_row)
+        if cached is not None:
+            return cached
+        row = self._engine.row(abs_row)
+        if len(self._row_cache) >= self._row_cache_cap:
+            self._row_cache.clear()
+        self._row_cache[abs_row] = row
+        return row
+
     def _fg(self, value, bold: bool, bright_variant: str | None) -> QColor:
         key = (value, bold)
         cached = self._fg_cache.get(key)
@@ -975,11 +1143,18 @@ class TerminalWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         pal = self._palette
-        painter.fillRect(self.rect(), self._bg_default)
+        region = event.rect()
+        painter.fillRect(region, self._bg_default)
 
         cell_w, cell_h = max(1, int(self._cell_w)), max(1, int(self._cell_h))
-        first = 0
-        last = self._screen.lines - 1
+        columns = self._screen.columns
+        lines = self._screen.lines
+        # Repintado parcial: Qt puede pedir solo una región (parpadeo del cursor,
+        # daño de una fila…). Se calcula qué celdas caen dentro y se pinta solo eso.
+        first = max(0, int((region.top() - PAD_Y) // cell_h))
+        last = min(lines - 1, int((region.bottom() - PAD_Y) // cell_h))
+        first_col = max(0, int((region.left() - PAD_X) // cell_w))
+        last_col = min(columns - 1, int((region.right() - PAD_X) // cell_w))
         base = self._history_len() - self._scroll_offset
         sel_rows = self._selection_rows()
         sel_start, sel_end = (
@@ -988,48 +1163,49 @@ class TerminalWidget(QWidget):
             else (None, None)
         )
 
-        for row in range(first, last + 1):
-            y = int(PAD_Y + row * cell_h)
-            chars = self._row_abs(base + row)
+        if first <= last and first_col <= last_col:
+            for row in range(first, last + 1):
+                y = int(PAD_Y + row * cell_h)
+                chars = self._row_for_paint(base + row)
 
-            sel_from = sel_to = None
-            if sel_start is not None and sel_rows[0] <= base + row <= sel_rows[1]:
-                c_from, c_to = 0, self._screen.columns - 1
-                if base + row == sel_start[0]:
-                    c_from = sel_start[1]
-                if base + row == sel_end[0]:
-                    c_to = sel_end[1]
-                painter.fillRect(
-                    QRect(int(PAD_X + c_from * cell_w), y, (c_to - c_from + 1) * cell_w, cell_h),
-                    self._selection_color,
-                )
-                sel_from, sel_to = c_from, c_to
+                sel_from = sel_to = None
+                if sel_start is not None and sel_rows[0] <= base + row <= sel_rows[1]:
+                    c_from, c_to = 0, columns - 1
+                    if base + row == sel_start[0]:
+                        c_from = sel_start[1]
+                    if base + row == sel_end[0]:
+                        c_to = sel_end[1]
+                    painter.fillRect(
+                        QRect(int(PAD_X + c_from * cell_w), y, (c_to - c_from + 1) * cell_w, cell_h),
+                        self._selection_color,
+                    )
+                    sel_from, sel_to = c_from, c_to
 
-            run_text: list[str] = []
-            run_x = 0
-            run_pen = None
-            x = int(PAD_X)
-            for col in range(self._screen.columns):
-                ch = chars[col]
-                if ch.data == "":
+                run_text: list[str] = []
+                run_x = 0
+                run_pen = None
+                x = int(PAD_X + first_col * cell_w)
+                for col in range(first_col, last_col + 1):
+                    ch = chars[col]
+                    if ch.data == "":
+                        x += cell_w
+                        continue
+                    # Las TUI (OpenCode) pintan con fondo propio: si no marcamos la
+                    # selección en el trazo, ese fondo tapa el resaltado y parece
+                    # que seleccionar no funciona.
+                    selected = sel_from is not None and sel_from <= col <= sel_to
+                    pen = (
+                        ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough,
+                        ch.reverse, selected,
+                    )
+                    if pen != run_pen:
+                        self._flush_run(painter, run_text, run_x, y, run_pen)
+                        run_text = []
+                        run_pen = pen
+                        run_x = x
+                    run_text.append(ch.data if ch.data else " ")
                     x += cell_w
-                    continue
-                # Las TUI (OpenCode) pintan con fondo propio: si no marcamos la
-                # selección en el trazo, ese fondo tapa el resaltado y parece
-                # que seleccionar no funciona.
-                selected = sel_from is not None and sel_from <= col <= sel_to
-                pen = (
-                    ch.fg, ch.bg, ch.bold, ch.italics, ch.underscore, ch.strikethrough,
-                    ch.reverse, selected,
-                )
-                if pen != run_pen:
-                    self._flush_run(painter, run_text, run_x, y, run_pen)
-                    run_text = []
-                    run_pen = pen
-                    run_x = x
-                run_text.append(ch.data if ch.data else " ")
-                x += cell_w
-            self._flush_run(painter, run_text, run_x, y, run_pen)
+                self._flush_run(painter, run_text, run_x, y, run_pen)
 
         # Cursor: solo en el terminal con foco, y del tamaño exacto de la celda
         # para no dejar un pixel extra en la celda vecina.
@@ -1041,9 +1217,9 @@ class TerminalWidget(QWidget):
         ):
             cx = self._screen.cursor.x
             cy = self._screen.cursor.y
-            if 0 <= cy < self._screen.lines and 0 <= cx < self._screen.columns:
+            if 0 <= cy < lines and 0 <= cx < columns:
                 rect_cursor = QRect(int(PAD_X + cx * cell_w), int(PAD_Y + cy * cell_h), cell_w, cell_h)
-                chars = self._row_abs(base + cy)
+                chars = self._row_for_paint(base + cy)
                 char = chars[cx].data or " "
                 painter.fillRect(rect_cursor, self._cursor_color)
                 painter.setFont(self._font)
@@ -1099,24 +1275,17 @@ class TerminalWidget(QWidget):
         elif bg != self._bg_default or reverse:
             painter.fillRect(QRect(origin_x, origin_y, len(content) * cell_w, cell_h), bg)
 
-        font = self._font
-        if bold and italics:
-            font = self._font_bold_italic
-        elif bold:
-            font = self._font_bold
-        elif italics:
-            font = self._font_italic
-        painter.setFont(font)
-        painter.setPen(fg)
-        # Un carácter por celda, recortado a ella: si no, el glifo y el cursor
-        # invaden el vecino y quedan manchas al mover el foco.
-        baseline = origin_y + self._ascent
+        font, style = self._run_font(bold, italics)
+        # Un blit por celda: el mapa de bits ya viene recortado a la celda, así que
+        # el glifo no invade la vecina (lo que antes exigía clip por glifo). Los
+        # espacios no tienen tinta: se saltan (el fondo ya está pintado).
+        atlas = self._atlas
         for index, glyph in enumerate(content):
-            cell = QRect(origin_x + index * cell_w, origin_y, cell_w, cell_h)
-            painter.save()
-            painter.setClipRect(cell, Qt.ClipOperation.IntersectClip)
-            painter.drawText(QPointF(cell.x(), baseline), glyph)
-            painter.restore()
+            if glyph == " ":
+                continue
+            painter.drawPixmap(
+                origin_x + index * cell_w, origin_y, atlas.pixmap(glyph, font, fg, style)
+            )
 
         if underscore or strikethrough:
             pen_line = painter.pen()
@@ -1129,6 +1298,16 @@ class TerminalWidget(QWidget):
             if strikethrough:
                 sy = origin_y + self._ascent - cell_h * 0.28
                 painter.drawLine(QPointF(origin_x, sy), QPointF(origin_x + width, sy))
+
+    def _run_font(self, bold: bool, italics: bool) -> tuple[QFont, int]:
+        """Fuente de una corrida y su identificador (para la clave del atlas)."""
+        if bold and italics:
+            return self._font_bold_italic, 3
+        if bold:
+            return self._font_bold, 1
+        if italics:
+            return self._font_italic, 2
+        return self._font, 0
 
     # ------------------------------------------------------------------ foco
     def focusInEvent(self, event) -> None:  # noqa: N802

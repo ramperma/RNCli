@@ -327,6 +327,40 @@ de OpenCode, por eso cada uno puede mostrar su propia pantalla inicial. Escribe 
 panel y pulsa Enter, como en OpenCode normal; RNCli solo proporciona la ventana, las
 pestañas y el mosaico alrededor.
 
+## Rendimiento del pintado
+
+Con una pantalla de 138×45 celdas (1400×820 px) y contenido a color, medido en la
+máquina de desarrollo (`tests/smoke_test.py` + banco de pintado):
+
+| Escenario | Antes | Ahora |
+| --- | --- | --- |
+| Repintado completo | 84 ms | 8 ms |
+| Tecla suelta (eco del agente) | 83 ms | 0,3 ms |
+| Línea a medio escribir (token del agente) | 83 ms | 0,4 ms |
+| Parpadeo del cursor | 84 ms | 0,1 ms |
+| Línea nueva (desplaza la pantalla) | 81 ms | 17 ms |
+| Ráfaga de 30 KB (`cat`) | 86 ms | 17 ms |
+| Rueda del ratón (3 líneas) | 84 ms | 9 ms |
+
+Las claves:
+
+* **Daño por fila**: el motor dice qué líneas y columnas cambiaron (alacritty por
+  Rust; pyte también lo marca) y solo esas se vuelven a pedir y repintar. Antes,
+  cualquier byte recibido repintaba las 45 filas de la pantalla.
+* **Atlas de glifos**: cada carácter se rasteriza una vez por (estilo, color) y
+  luego se copia con `drawPixmap`, en lugar de `drawText` con recorte por celda.
+  La imagen es idéntica píxel a píxel y el pintado es ~5× más rápido.
+* **Caché de filas**: las filas ya convertidas se reutilizan entre fotogramas; el
+  parpadeo, la selección, la rueda o los repintados parciales no vuelven a
+  pedírselas al motor. Se acota (3 pantallas) y se invalida por daño, cambio de
+  tamaño o recorte del historial.
+* **Repintado parcial**: `paintEvent` respeta la región que pide Qt, así que el
+  parpadeo del cursor repinta una sola celda.
+
+Con `RNCLI_PYTE=1` se fuerza el motor de Python (pyte): todo funciona igual, algo
+más lento al convertir filas. El motor nativo se recompila solo con `run.sh`
+cuando cambian las fuentes de `native/`.
+
 ## Estructura del proyecto
 
 ```
@@ -336,7 +370,7 @@ rncli/
 ├── layouts.py       # diseños 1 / 2v / 2h / 4 / 6 / todos y difusión
 ├── pane.py          # panel = cabecera + terminal
 ├── terminal.py      # pintado + entrada + historial + selección
-├── vt_engine.py     # elige motor VT nativo (Rust) o pyte, misma API
+├── vt_engine.py     # elige motor VT nativo (Rust) o pyte, misma API (incluido el daño)
 ├── pty_session.py   # pty no bloqueante (nativo o helper python)
 ├── _spawn.py        # setsid + TIOCSCTTY + execvp (helper de arranque)
 ├── native/          # crate PyO3: PTY + emulador VT (alacritty_terminal)
@@ -356,6 +390,7 @@ tests/native_test.py # pruebas del motor nativo (se omiten si no está compilado
 
 ```bash
 .venv/bin/python tests/smoke_test.py --screenshot /tmp/rncli.png   # funcionalidad
+RNCLI_PYTE=1 .venv/bin/python tests/smoke_test.py                 # con el motor pyte
 .venv/bin/python tests/desktop_env_test.py                        # arranque desde el menú
 .venv/bin/python tests/native_test.py                             # motor nativo (si compilado)
 ./tests/cierre_test.sh                                            # sin agentes huérfanos
@@ -365,8 +400,9 @@ tests/native_test.py # pruebas del motor nativo (se omiten si no está compilado
   salida real, los diseños, la difusión (una orden ejecutada de verdad en otro panel), el
   historial, el portapapeles, el guardado y la restauración de la sesión, los ajustes en
   caliente, los fragmentos de sudo, las conexiones SSH (destino, comando y guardado), que
-  Tab llega al terminal seleccionado y que se pueden soltar archivos (imagen, PDF, texto)
-  en un terminal.
+  Tab llega al terminal seleccionado, que se pueden soltar archivos (imagen, PDF, texto)
+  en un terminal y que el pintado rápido (daño por fila, caché y atlas) no cambia la
+  imagen ni deja filas obsoletas.
 * `desktop_env_test.py` lanza RNCli con un PATH mínimo (como hace el escritorio) y
   verifica que encuentra `opencode`, `pi`, `git`… y que la TUI de opencode arranca.
 * `cierre_test.sh` arranca la aplicación, toma su PID real de la ventana X11 y comprueba

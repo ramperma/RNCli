@@ -7,7 +7,7 @@ use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -315,6 +315,24 @@ impl NativeVte {
 
     fn row(&self, abs_row: usize) -> RowTuple {
         self.dump_row(abs_row)
+    }
+
+    /// Daño acumulado desde la última llamada: `None` = pantalla entera, o una
+    /// lista de `(línea, columna_izquierda, columna_derecha)` del viewport.
+    /// Al leerlo se reinicia, así Python solo repinta las filas tocadas.
+    fn take_damage(&mut self) -> Option<Vec<(usize, usize, usize)>> {
+        match self.term.damage() {
+            TermDamage::Full => {
+                self.term.reset_damage();
+                None
+            }
+            TermDamage::Partial(iter) => {
+                let lines: Vec<(usize, usize, usize)> =
+                    iter.map(|bounds| (bounds.line, bounds.left, bounds.right)).collect();
+                self.term.reset_damage();
+                Some(lines)
+            }
+        }
     }
 
     fn cursor(&self) -> (usize, usize, bool) {

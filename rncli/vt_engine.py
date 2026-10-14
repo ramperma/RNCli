@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 try:
+    # RNCLI_PYTE=1 fuerza el motor de Python (equipos sin Rust y pruebas).
+    if os.environ.get("RNCLI_PYTE"):
+        raise ImportError("motor pyte forzado por RNCLI_PYTE")
     import rncli_native
 except ImportError:
     rncli_native = None
@@ -182,6 +186,13 @@ class NativeEngine:
             return [BLANK] * self.columns()
         return unpack_row(self._vte.row(int(abs_row)))
 
+    def take_damage(self) -> list[tuple[int, int, int]] | None:
+        """Filas del viewport que han cambiado (None = toda la pantalla)."""
+        damage = self._vte.take_damage()
+        if damage is None:
+            return None
+        return [(int(line), int(left), int(right)) for line, left, right in damage]
+
     def cursor(self) -> tuple[int, int, bool]:
         x, y, hidden = self._vte.cursor()
         return int(x), int(y), bool(hidden)
@@ -250,6 +261,14 @@ class PyteEngine:
             row = self.screen.buffer[y]
             return [row[col] for col in range(cols)]
         return [self.blank] * cols
+
+    def take_damage(self) -> list[tuple[int, int, int]]:
+        """pyte ya marca las líneas sucias del viewport; las pasamos igual que Rust."""
+        dirty = list(getattr(self.screen, "dirty", ()) or ())
+        if dirty:
+            self.screen.dirty.clear()
+        cols = self.columns()
+        return [(int(y), 0, cols - 1) for y in dirty if 0 <= y < self.screen.lines]
 
     def cursor(self) -> tuple[int, int, bool]:
         cur = self.screen.cursor

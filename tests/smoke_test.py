@@ -1079,6 +1079,102 @@ def main() -> int:
         check(False, "el terminal acepta soltar un archivo del explorador")
         check(False, "soltar un archivo lo pega en ese terminal")
 
+    # --- Velocidad: daño del motor, caché de filas y atlas de glifos ---
+    from PySide6.QtCore import QObject, QRect, Signal
+
+    from rncli.terminal import PAD_X, PAD_Y, TerminalWidget
+    from rncli.vt_engine import make_engine
+
+    probe = make_engine(20, 6, 100)
+    first = probe.take_damage()
+    probe.feed(b"hola")
+    damage = probe.take_damage() or []
+    check(
+        any(line == 0 for line, _left, _right in damage),
+        "el motor informa de la fila dañada al escribir",
+    )
+    if probe.native:
+        check(
+            first is None,
+            "el motor nativo arranca con daño de pantalla completa",
+        )
+        probe.feed(b"relleno\r\n" * 10)
+        check(
+            probe.take_damage() is None,
+            "un scroll de pantalla fuerza el repintado completo",
+        )
+    else:
+        check(
+            isinstance(first, list) and len(first) == 6,
+            "pyte arranca marcando toda la pantalla",
+        )
+        probe.feed(b"relleno\r\n" * 10)
+        check(
+            len(probe.take_damage() or []) == 6,
+            "pyte marca toda la pantalla al hacer scroll",
+        )
+
+    view = target.terminal if target is not None else None
+    if view is not None and view._screen.columns > 1:
+        view.feed_text("coherencia-cache-rncli\n")
+        wait(80)
+        history = view._history_len()
+        coherent = all(
+            [cell.data for cell in view._row_for_paint(history + row)]
+            == [cell.data for cell in view._engine.row(history + row)]
+            for row in range(view._screen.lines)
+        )
+        check(coherent, "la caché de filas coincide con el motor tras escribir")
+        check(
+            len(view._row_cache) <= view._row_cache_cap,
+            "la caché de filas está acotada",
+        )
+    else:
+        check(False, "la caché de filas coincide con el motor tras escribir")
+        check(False, "la caché de filas está acotada")
+
+    class _FakeTerm(QObject):
+        dataReceived = Signal(bytes)
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return True
+
+        def resize(self, cols: int, rows: int) -> None:
+            pass
+
+    paint_view = TerminalWidget(_FakeTerm(), config.settings, window)
+    paint_view.resize(440, 180)
+    paint_view.show()
+    wait(60)
+    paint_view.session.dataReceived.emit(b"\x1b[1mhola\x1b[0m rncli \xe2\x9c\x93\r\n")
+    wait(60)
+    paint_view.update()
+    wait(60)
+    painted = len(paint_view._atlas._cache)
+    check(painted > 0, "el atlas de glifos cachea lo pintado")
+    paint_view.update()
+    wait(60)
+    check(
+        len(paint_view._atlas._cache) == painted,
+        "el atlas reutiliza los glifos ya pintados",
+    )
+    full = paint_view.grab().toImage()
+    cell = paint_view._cursor_rect() or QRect(
+        int(PAD_X), int(PAD_Y), int(paint_view._cell_w), int(paint_view._cell_h)
+    )
+    paint_view.update(cell)
+    wait(60)
+    check(
+        paint_view.grab().toImage() == full,
+        "el repintado parcial de una celda deja la misma imagen",
+    )
+    paint_view.set_font(config.settings.font_family, int(config.settings.font_size))
+    check(not paint_view._atlas._cache, "cambiar la fuente vacía el atlas de glifos")
+    paint_view.deleteLater()
+
     if args.screenshot:
         window.workspace().set_layout("all")
         wait(250)
