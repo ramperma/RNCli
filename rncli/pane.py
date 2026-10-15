@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QEvent, QMimeData, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QDrag
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -21,6 +23,20 @@ from .pty_session import PtySession
 from .terminal import TerminalWidget
 from .theme import theme
 
+#: MIME interno para arrastrar un panel a otro sitio o a otra pestaña.
+PANE_MIME = "application/x-rncli-pane"
+
+_active_drag = None
+
+
+def is_pane_drag(mime) -> bool:
+    return mime is not None and mime.hasFormat(PANE_MIME)
+
+
+def dragging_pane() -> PaneWidget | None:
+    """Panel que se está arrastrando, o None si no hay un arrastre en curso."""
+    return _active_drag
+
 
 class PaneWidget(QFrame):
     """Un agente ejecutándose en su propia terminal."""
@@ -33,6 +49,7 @@ class PaneWidget(QFrame):
     userFocusRequested = Signal(object)
     directoryDropped = Signal(object, str)
     filesDropped = Signal(object, list)
+    paneMoveDropped = Signal(object, object, str)
 
     def __init__(self, agent: Agent, settings, cwd: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -43,11 +60,16 @@ class PaneWidget(QFrame):
         self.terminal: TerminalWidget | None = None
         self.scrollbar: QScrollBar | None = None
         self.title = agent.name
+        self.pane_id = format(id(self), "x")
         self._grave: list[PtySession] = []
+        self._drag_origin_global: QPoint | None = None
+        self._drop_edge: str | None = None
+        self._drag_widgets: tuple[QWidget, ...] = ()
 
         self.setObjectName("Pane")
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setAcceptDrops(True)
 
         self._build_header()
         self.start()
@@ -57,6 +79,8 @@ class PaneWidget(QFrame):
         self.header = QWidget(self)
         self.header.setObjectName("PaneHeader")
         self.header.setFixedHeight(34)
+        self.header.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.header.setToolTip("Arrastra para reordenar o soltar en otra pestaña")
         layout = QHBoxLayout(self.header)
         layout.setContentsMargins(10, 0, 6, 0)
         layout.setSpacing(8)
@@ -117,6 +141,131 @@ class PaneWidget(QFrame):
         outer.setSpacing(0)
         outer.addWidget(self.header)
         outer.addWidget(self.body, 1)
+
+        self._drag_widgets = (
+            self.header,
+            self.dot,
+            self.name_label,
+            self.path_label,
+            self.status_label,
+            self.broadcast_label,
+        )
+        for widget in self._drag_widgets:
+            widget.installEventFilter(self)
+            widget.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    # ------------------------------------------------------------------ arrastre
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched in self._drag_widgets:
+            etype = event.type()
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_origin_global = event.globalPosition().toPoint()
+                self.focusRequested.emit(self)
+                self.userFocusRequested.emit(self)
+            elif (
+                etype == QEvent.Type.MouseMove
+                and self._drag_origin_global is not None
+                and event.buttons() & Qt.MouseButton.LeftButton
+            ):
+                delta = event.globalPosition().toPoint() - self._drag_origin_global
+                if delta.manhattanLength() >= QApplication.startDragDistance():
+                    self._drag_origin_global = None
+                    self._begin_pane_drag()
+                    return True
+            elif etype == QEvent.Type.MouseButtonRelease:
+                self._drag_origin_global = None
+        return super().eventFilter(watched, event)
+
+    def _begin_pane_drag(self) -> None:
+        """Arranca un QDrag con este panel; el destino decide si reordena o cambia de pestaña."""
+        global _active_drag
+        _active_drag = self
+        mime = QMimeData()
+        mime.setData(PANE_MIME, QByteArray(self.pane_id.encode("utf-8")))
+        host = self.window() if self.window() is not None else self
+        drag = QDrag(host)
+        drag.setMimeData(mime)
+        pixmap = self.header.grab()
+        if not pixmap.isNull():
+            drag.setPixmap(pixmap)
+            drag.setHotSpot(pixmap.rect().center())
+        try:
+            drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        finally:
+            _active_drag = None
+            self.set_drop_edge(None)
+
+    def accept_pane_drag(self, mime=None) -> bool:
+        return is_pane_drag(mime) if mime is not None else dragging_pane() is not None
+
+    def show_pane_drop(self, pos) -> None:
+        source = dragging_pane()
+        if source is None or source is self:
+            self.set_drop_edge(None)
+            return
+        self.set_drop_edge(self._edge_at(pos))
+
+    def receive_pane_drop(self, pos) -> None:
+        source = dragging_pane()
+        self.set_drop_edge(None)
+        if source is None or source is self:
+            return
+        edge = self._edge_at(pos)
+        # Diferir el movimiento: reparentar el origen mientras QDrag.exec sigue
+        # activo cancela el arrastre o destruye el widget a medias.
+        QTimer.singleShot(0, lambda s=source, t=self, e=edge: self.paneMoveDropped.emit(s, t, e))
+
+    def _edge_at(self, pos) -> str:
+        x = pos.x()
+        y = pos.y()
+        width = max(1, self.width())
+        height = max(1, self.height())
+        mode = None
+        parent = self.parent()
+        while parent is not None:
+            mode = getattr(parent, "layout_mode", None)
+            if isinstance(mode, str):
+                break
+            parent = parent.parent()
+        # En paralelo solo cuenta izquierda/derecha; apilados, arriba/abajo.
+        if mode in ("2v", "1"):
+            return "left" if x < width / 2 else "right"
+        if mode == "2h":
+            return "top" if y < height / 2 else "bottom"
+        if abs(x - width / 2) >= abs(y - height / 2):
+            return "left" if x < width / 2 else "right"
+        return "top" if y < height / 2 else "bottom"
+
+    def set_drop_edge(self, edge: str | None) -> None:
+        if edge == self._drop_edge:
+            return
+        self._drop_edge = edge
+        self._apply_frame(self.property("rncliActive") is True)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if dragging_pane() is not None:
+            event.acceptProposedAction()
+            self.show_pane_drop(event.position())
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if dragging_pane() is not None:
+            event.acceptProposedAction()
+            self.show_pane_drop(event.position())
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self.set_drop_edge(None)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if dragging_pane() is None:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        self.receive_pane_drop(event.position())
 
     # ------------------------------------------------------------------ arranque
     def start(self) -> None:
@@ -253,6 +402,8 @@ class PaneWidget(QFrame):
 
     def _on_osc_title(self, title: str) -> None:
         self.name_label.setToolTip(title)
+        drag_hint = "Arrastra para reordenar o soltar en otra pestaña"
+        self.header.setToolTip(f"{title}\n\n{drag_hint}" if title else drag_hint)
 
     # ------------------------------------------------------------------ ajustes
     def apply_settings(self, settings, theme_name: str) -> None:
@@ -281,8 +432,24 @@ class PaneWidget(QFrame):
 
     def set_active(self, active: bool) -> None:
         self.setProperty("rncliActive", bool(active))
+        self._apply_frame(bool(active))
+
+    def _apply_frame(self, active: bool) -> None:
         pal = theme(self.settings.theme)
         color = pal["accent"] if active else pal["border"]
+        drop = self._drop_edge
+        if drop in ("left", "right", "top", "bottom"):
+            accent = pal["accent"]
+            edges = ("top", "right", "bottom", "left")
+            parts = [
+                f"border-{side}: {'4px' if side == drop else '1px'} solid "
+                f"{accent if side == drop else color}"
+                for side in edges
+            ]
+            self.setStyleSheet(
+                f"#Pane {{ {'; '.join(parts)}; border-radius: 8px; background: {pal['bg']}; }}"
+            )
+            return
         self.setStyleSheet(
             f"#Pane {{ border: 1px solid {color}; border-radius: 8px; background: {pal['bg']}; }}"
         )

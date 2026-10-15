@@ -45,6 +45,7 @@ SHORTCUT_DEFAULTS: dict[str, str] = {
     "close_pane": "Ctrl+Shift+W",
     "close_tab": "Ctrl+Shift+X",
     "rename_tab": "F2",
+    "move_pane": "Ctrl+Shift+G",
     "next_tab": "Ctrl+Tab",
     "prev_tab": "Ctrl+Shift+Tab",
     "quit": "Ctrl+Shift+Q",
@@ -89,6 +90,7 @@ SHORTCUT_LABELS: dict[str, str] = {
     "close_pane": "Cerrar el panel activo",
     "close_tab": "Cerrar la pestaña",
     "rename_tab": "Renombrar la pestaña",
+    "move_pane": "Mover un panel a otra pestaña (o a una nueva)",
     "next_tab": "Pestaña siguiente",
     "prev_tab": "Pestaña anterior",
     "quit": "Salir",
@@ -116,7 +118,7 @@ SHORTCUT_LABELS: dict[str, str] = {
 # Orden para la ayuda (F1) y la pestaña de atajos de Ajustes.
 SHORTCUT_SECTIONS: list[tuple[str, list[str]]] = [
     ("Pestañas y paneles", ["new_tab", "new_pane", "new_ssh", "close_pane", "close_tab",
-                            "rename_tab", "next_tab", "prev_tab"]),
+                            "rename_tab", "move_pane", "next_tab", "prev_tab"]),
     ("Diseño y paneles", ["layout_1", "layout_2v", "layout_2h", "layout_4", "layout_6",
                           "layout_all", "focus_next", "focus_prev", "maximize"]),
     ("Agente", ["restart", "broadcast"]),

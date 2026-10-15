@@ -902,17 +902,42 @@ class TerminalWidget(QWidget):
             self.paste()
         super().mousePressEvent(event)
 
+    def _parent_pane(self):
+        """Panel que contiene esta terminal (sin importar PaneWidget: ciclo de imports)."""
+        widget = self.parent()
+        while widget is not None:
+            if callable(getattr(widget, "accept_pane_drag", None)):
+                return widget
+            widget = widget.parent()
+        return None
+
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         if local_drop_paths(event.mimeData()):
             event.acceptProposedAction()
-        else:
-            event.ignore()
+            return
+        pane = self._parent_pane()
+        if pane is not None and pane.accept_pane_drag(event.mimeData()):
+            event.acceptProposedAction()
+            pane.show_pane_drop(self.mapTo(pane, event.position().toPoint()))
+            return
+        event.ignore()
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
         if local_drop_paths(event.mimeData()):
             event.acceptProposedAction()
-        else:
-            event.ignore()
+            return
+        pane = self._parent_pane()
+        if pane is not None and pane.accept_pane_drag(event.mimeData()):
+            event.acceptProposedAction()
+            pane.show_pane_drop(self.mapTo(pane, event.position().toPoint()))
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        pane = self._parent_pane()
+        if pane is not None:
+            pane.set_drop_edge(None)
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event) -> None:  # noqa: N802
         files, directories = split_drop_paths(local_drop_paths(event.mimeData()))
@@ -925,6 +950,11 @@ class TerminalWidget(QWidget):
         if directories:
             self.directoryDropped.emit(directories[0])
             event.acceptProposedAction()
+            return
+        pane = self._parent_pane()
+        if pane is not None and pane.accept_pane_drag(event.mimeData()):
+            event.acceptProposedAction()
+            pane.receive_pane_drop(self.mapTo(pane, event.position().toPoint()))
             return
         event.ignore()
 

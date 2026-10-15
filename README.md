@@ -64,6 +64,13 @@ La conexión se abre en **una pestaña nueva con una terminal real**, así que d
 lanzar agentes, editar con vim, usar `htop`… como si estuvieras en la máquina remota
 (ssh pide la contraseña de forma interactiva en ese mismo panel).
 
+* En **Agente remoto** eliges qué CLI arrancar al conectar (`OpenCode`, `Pi`, `cursor-agent`…).
+  «Solo shell» deja una sesión de login. El agente se ejecuta con un shell de login en
+  el equipo remoto, para que herede su PATH (`~/.opencode/bin`, `~/.local/bin`…).
+* **Provisionar clave SSH** crea una clave ed25519 si no tienes ninguna, la copia al
+  equipo con `ssh-copy-id` (ahí escribes la contraseña **una vez**) y, si va bien,
+  abre automáticamente el agente seleccionado. A partir de entonces `Conectar` entra
+  sin pedir contraseña.
 * Marca **«Guardar este equipo»** para reutilizarlo: se guarda en `config.json` y aparece
   en **Equipos guardados**. Puedes eliminarlo con **Eliminar guardado**.
 * **Mantener viva la conexión** añade `ServerAliveInterval=30` para detectar caídas de red.
@@ -93,6 +100,20 @@ y después elige un diseño en la barra (`1`, `2`, `4`…). Si eliges un diseño
 pestañas abiertas, RNCli también te ofrece esa conversión automáticamente.
 
 En enfocar con `Ctrl+Shift+←` / `Ctrl+Shift+→`, el panel activo siempre entra en el diseño visible.
+
+Para **mover un panel**, arrastra su **cabecera** (el nombre del agente):
+
+* Suéltalo sobre **otro panel de la misma pestaña** (mitad izquierda/arriba o
+  derecha/abajo) para **reordenar**.
+* Suéltalo sobre **otra pestaña** (o mantén el arrastre un instante sobre ella para
+  entrar y colocar el panel en un sitio concreto).
+* Suéltalo en el **＋** de la barra, o a la derecha de las pestañas, para abrirlo en
+  una **pestaña nueva**.
+
+El proceso **sigue vivo** durante el movimiento. Si la pestaña de origen queda vacía,
+desaparece. También puedes usar **··· → Mover panel a otra pestaña** (o
+`Sesión → …`, o `Ctrl+Shift+G`): el diálogo pregunta qué panel mover (el activo lleva
+`●`) y a dónde (otra pestaña, o `＋ Nueva pestaña`).
 
 ### Difusión (una orden para todos)
 `Ctrl+Shift+B` activa la difusión `⇢`: todo lo que escribas se envía **también** a los
@@ -134,6 +155,7 @@ herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas
 | `Ctrl+Shift+S` | Nueva conexión SSH a un equipo remoto |
 | `Ctrl+Shift+W` / `Ctrl+Shift+X` | Cerrar panel / pestaña |
 | `F2` | Renombrar pestaña |
+| `Ctrl+Shift+G` | Mover un panel a otra pestaña (o a una nueva) |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Pestaña siguiente / anterior |
 | `Ctrl+Shift+→` / `Ctrl+Shift+←` | Enfocar panel siguiente / anterior |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V` | Copiar / pegar |
@@ -144,6 +166,7 @@ herramientas se oculta con el botón **Ocultar**, `Ver → Barra de herramientas
 | `Shift+PageUp` / `Shift+PageDown` | Historial de la terminal |
 | Rueda del ratón | La TUI si pide ratón (OpenCode); si no, historial (`Shift` + rueda = historial siempre) |
 | Arrastrar con el ratón | Seleccionar texto (se ve incluso sobre TUIs con colores propios); con **Copiar al seleccionar** activo en Ajustes, se copia al soltar |
+| Arrastrar la cabecera de un panel | Reordenar en la pestaña o soltar en otra pestaña / en **＋** |
 | `Ctrl+Shift+R` | Reiniciar el agente activo (`Enter` en una terminal terminada) |
 | `Ctrl+Shift+E` | Mostrar u ocultar el **Explorador** |
 | `Ctrl+Shift+H` | Mostrar u ocultar la **barra de herramientas** |
@@ -196,7 +219,8 @@ que copia la ruta al portapapeles). Formato:
       "port": 2222,
       "identity": "~/.ssh/id_ed25519",
       "options": ["-L", "8080:localhost:80"],
-      "keepalive": true
+      "keepalive": true,
+      "remote_agent": "opencode"
     }
   ]
 }
@@ -375,7 +399,7 @@ rncli/
 ├── _spawn.py        # setsid + TIOCSCTTY + execvp (helper de arranque)
 ├── native/          # crate PyO3: PTY + emulador VT (alacritty_terminal)
 ├── agents.py        # perfiles de agentes (opencode, pi, cursor, claude, gemini, shell)
-├── ssh_hosts.py     # destinos SSH y construcción del comando ssh
+├── ssh_hosts.py     # destinos SSH, ssh-copy-id y comando remoto del agente
 ├── shell_env.py     # PATH real del usuario y búsqueda de ejecutables
 ├── config.py        # config.json (agentes, ajustes, equipos SSH) y session.json
 ├── dialogs.py       # selector de agentes, SSH, ajustes, atajos y asistente de sudo
@@ -399,7 +423,8 @@ RNCLI_PYTE=1 .venv/bin/python tests/smoke_test.py                 # con el motor
 * `smoke_test.py` comprueba que los paneles arrancan, que la terminal interpreta color y
   salida real, los diseños, la difusión (una orden ejecutada de verdad en otro panel), el
   historial, el portapapeles, el guardado y la restauración de la sesión, los ajustes en
-  caliente, los fragmentos de sudo, las conexiones SSH (destino, comando y guardado), que
+  caliente, los fragmentos de sudo, las conexiones SSH (destino, comando, agente remoto y
+  provisión de clave), que
   Tab llega al terminal seleccionado, que se pueden soltar archivos (imagen, PDF, texto)
   en un terminal y que el pintado rápido (daño por fila, caché y atlas) no cambia la
   imagen ni deja filas obsoletas.

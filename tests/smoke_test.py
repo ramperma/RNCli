@@ -463,10 +463,74 @@ def main() -> int:
         and ssh_cmd[-1] == "root@10.0.0.5",
         "el comando ssh incluye puerto, identidad y opciones",
     )
+    remote_cmd = SshHost(
+        host="10.0.0.5",
+        user="root",
+        identity="~/.ssh/id_ed25519",
+    ).command(["opencode", "--model", "sonnet"])
+    check(
+        remote_cmd[0] == "ssh"
+        and "-t" in remote_cmd
+        and remote_cmd[-3:] == ["bash", "-lc", "opencode --model sonnet"],
+        "el comando ssh remoto lanza el agente con TTY y un shell de login",
+    )
+    remote_agent = Agent(
+        id="opencode",
+        name="OpenCode",
+        command=["opencode"],
+        emoji="◆",
+        color="#4ade80",
+    )
+    ssh_agent = SshHost(host="box", user="dev", remote_agent="opencode").to_agent(remote_agent)
+    check(
+        ssh_agent.id == "ssh:dev@box:opencode"
+        and "OpenCode" in ssh_agent.name
+        and "-t" in ssh_agent.command
+        and ssh_agent.command[-1].startswith("opencode"),
+        "to_agent con agente remoto construye el panel SSH+agente",
+    )
     check(
         SshHost.from_dict(SshHost(host="h", user="u").to_dict()).id == "u@h:22",
         "los equipos SSH se serializan y se recuperan",
     )
+    restored = SshHost.from_dict(
+        SshHost(host="h", user="u", remote_agent="pi", identity="~/.ssh/id_ed25519").to_dict()
+    )
+    check(
+        restored.remote_agent == "pi" and restored.identity.endswith("id_ed25519"),
+        "los equipos SSH conservan el agente remoto y la clave",
+    )
+    from rncli.ssh_hosts import ensure_ssh_identity, public_key_path
+
+    provision = SshHost(
+        host="10.0.0.5",
+        user="root",
+        port=2222,
+        identity="~/.ssh/id_ed25519",
+    ).provision_command()
+    check(
+        provision[0].endswith("ssh-copy-id") or provision[0] == "bash",
+        "provisionar clave usa ssh-copy-id (o un fallback bash)",
+    )
+    if provision[0].endswith("ssh-copy-id") or os.path.basename(provision[0]) == "ssh-copy-id":
+        check(
+            "-i" in provision and "2222" in provision and provision[-1] == "root@10.0.0.5",
+            "ssh-copy-id recibe la clave pública, el puerto y el destino",
+        )
+    with tempfile.TemporaryDirectory(prefix="rncli-ssh-key-") as key_dir:
+        key_path = os.path.join(key_dir, "id_ed25519")
+        try:
+            private, notice = ensure_ssh_identity(key_path)
+            check(
+                os.path.isfile(private)
+                and os.path.isfile(public_key_path(private))
+                and "clave" in notice.lower(),
+                "si no hay clave SSH se crea una ed25519",
+            )
+            again, silent = ensure_ssh_identity(key_path)
+            check(again == private and silent == "", "si la clave ya existe no se regenera")
+        except RuntimeError as exc:
+            check("ssh-keygen" in str(exc).lower(), "sin ssh-keygen se avisa con claridad")
 
     ssh_config = Config.load()
     ssh_config.ssh_hosts = [SshHost(host="equipo-u", user="u", name="Equipo U")]
@@ -478,16 +542,41 @@ def main() -> int:
 
     from rncli.dialogs import SshDialog
 
-    ssh_dialog = SshDialog(ssh_config.ssh_hosts, window)
+    ssh_dialog = SshDialog(
+        ssh_config.ssh_hosts,
+        window,
+        agents=config.agents,
+        default_agent="shell",
+    )
     ssh_dialog._apply_preset("alice@server:2222")
+    idx = ssh_dialog.agent_combo.findData("shell")
+    if idx < 0:
+        idx = 1 if ssh_dialog.agent_combo.count() > 1 else 0
+    ssh_dialog.agent_combo.setCurrentIndex(idx)
     ssh_dialog._connect()
     mini_host = ssh_dialog.result_host()
     check(
         mini_host is not None and mini_host.user == "alice" and mini_host.port == 2222,
         "el diálogo SSH construye el destino a partir del formulario",
     )
+    check(
+        ssh_dialog.agent_combo.count() >= 1
+        and ssh_dialog.provision_button is not None
+        and "Provisionar" in ssh_dialog.provision_button.text(),
+        "el diálogo SSH permite elegir agente remoto y provisionar la clave",
+    )
+    check(not ssh_dialog.wants_provision(), "conectar no marca la provisión de clave")
     ssh_dialog.save_check.setChecked(True)
     check(ssh_dialog.wants_save(), "el diálogo SSH permite guardar el equipo")
+    chosen = ssh_dialog.chosen_remote_agent()
+    check(
+        mini_host is not None
+        and (
+            (chosen is None and mini_host.remote_agent == "")
+            or (chosen is not None and mini_host.remote_agent == chosen.id)
+        ),
+        "el diálogo SSH guarda el agente remoto seleccionado",
+    )
     ssh_dialog.deleteLater()
 
     # --- diálogos ----------------------------------------------------------------
@@ -1180,6 +1269,124 @@ def main() -> int:
         wait(250)
         window.grab().save(args.screenshot)
         print(f"[info] captura guardada en {args.screenshot}")
+
+    # --- mover paneles entre pestañas -----------------------------------------
+    from rncli.dialogs import MovePaneDialog
+
+    main_ws = window.workspace()
+    before = main_ws.count()
+    donor = window.new_tab(shell, "/tmp")
+    wait(400)
+    check(window.tabs.count() == 2, "can create tabs")
+    moved_pane = donor.active_pane()
+    check(moved_pane is not None and moved_pane.is_alive(), "the panel to move is alive")
+    window._move_pane_to_tab(moved_pane, window.tabs.indexOf(main_ws))
+    wait(400)
+    check(main_ws.count() == before + 1, "the panel arrives in the other pestaña")
+    check(moved_pane.is_alive(), "the moved process stays alive during the move")
+    check(window.tabs.count() == 1, "the empty pestaña disappears")
+    pane2 = window.workspace().active_pane()
+    window._move_pane_to_tab(pane2, -1)
+    wait(400)
+    check(
+        window.tabs.count() == 2 and window.workspace().count() == 1,
+        "moving to a new pestaña creates one with the panel",
+    )
+    dialog = MovePaneDialog(window.workspace().panes(), [(0, "Other")], window)
+    check(
+        dialog.chosen_pane() is window.workspace().active_pane()
+        and dialog.chosen_target() == 0,
+        "the move dialog defaults to the active panel and the first tab",
+    )
+    dialog.deleteLater()
+
+    # --- arrastrar paneles (misma pestaña y otras) ----------------------------
+    import rncli.pane as pane_mod
+    from rncli.pane import PANE_MIME
+    from rncli.window import PaneDropTabBar
+
+    grid = window.new_tab(shell, "/tmp")
+    grid.add_pane(shell, "/tmp")
+    grid.set_layout("2v")
+    wait(400)
+    left, right = grid.panes()
+    check(left is not right and grid.count() == 2, "pestaña con dos paneles para reordenar")
+    grid.reorder_pane(right, 0)
+    wait(80)
+    check(
+        grid.panes()[0] is right and grid.panes()[1] is left,
+        "reorder_pane coloca el panel al principio",
+    )
+    grid.reorder_pane(right, 2)
+    wait(80)
+    check(
+        grid.panes()[0] is left and grid.panes()[1] is right,
+        "reorder_pane coloca el panel al final",
+    )
+
+    pane_mod._active_drag = left
+    mime = QMimeData()
+    mime.setData(PANE_MIME, left.pane_id.encode("utf-8"))
+    enter = QDragEnterEvent(
+        QPoint(8, 8),
+        Qt.DropAction.MoveAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    right.dragEnterEvent(enter)
+    check(enter.isAccepted(), "un panel acepta soltar otro panel")
+    drop_pos = QPointF(max(80.0, float(max(right.width(), 1)) - 4.0), 8.0)
+    drop_ev = QDropEvent(
+        drop_pos,
+        Qt.DropAction.MoveAction,
+        mime,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    right.dropEvent(drop_ev)
+    wait(120)
+    check(
+        bool(drop_ev.isAccepted())
+        and grid.panes()[0] is right
+        and grid.panes()[1] is left,
+        "soltar un panel a la derecha del otro cambia el orden",
+    )
+
+    other = window.new_tab(shell, "/tmp")
+    wait(300)
+    moving = other.active_pane()
+    bar = window.tabs.tabBar()
+    check(isinstance(bar, PaneDropTabBar), "la barra de pestañas es la que acepta paneles")
+    check(moving is not None and moving.is_alive(), "el panel a arrastrar a otra pestaña está vivo")
+    pane_mod._active_drag = moving
+    mime2 = QMimeData()
+    mime2.setData(PANE_MIME, moving.pane_id.encode("utf-8"))
+    dest_index = window.tabs.indexOf(grid)
+    tab_pos = bar.tabRect(dest_index).center()
+    enter2 = QDragEnterEvent(
+        tab_pos,
+        Qt.DropAction.MoveAction,
+        mime2,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    bar.dragEnterEvent(enter2)
+    check(enter2.isAccepted(), "la barra de pestañas acepta soltar un panel")
+    drop2 = QDropEvent(
+        QPointF(tab_pos),
+        Qt.DropAction.MoveAction,
+        mime2,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    bar.dropEvent(drop2)
+    wait(150)
+    check(
+        moving in grid.panes() and moving.is_alive(),
+        "soltar el panel en otra pestaña lo mueve sin matar el proceso",
+    )
+    pane_mod._active_drag = None
 
     window.shutdown()
     wait(200)

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QSizePolicy,
+    QTabBar,
     QTabWidget,
     QToolBar,
     QToolButton,
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__
-from .agents import Agent, pick_default_agent
+from .agents import Agent, find_agent, pick_default_agent
 from .config import (
     HOST_KEY_HINTS,
     LAYOUTS,
@@ -47,6 +48,7 @@ from .config import (
 from .dialogs import (
     AgentChooserDialog,
     AgentManagerDialog,
+    MovePaneDialog,
     SettingsDialog,
     ShortcutsDialog,
     SshDialog,
@@ -54,9 +56,54 @@ from .dialogs import (
 )
 from .file_browser import FileBrowserWidget
 from .layouts import LAYOUT_LABELS, LAYOUT_SHORT, WorkspaceWidget
+from .pane import dragging_pane, is_pane_drag
 from .ssh_hosts import SshHost
 from .terminal import TerminalWidget, is_host_key, tab_sequence
 from .theme import app_stylesheet
+
+
+TAB_HOVER_SWITCH_MS = 400
+
+
+class PaneDropTabBar(QTabBar):
+    """Barra de pestañas que acepta paneles arrastrados."""
+
+    paneDroppedOnTab = Signal(int, object)  # índice de pestaña (-1 = nueva), panel
+    paneHoverTab = Signal(int)  # índice bajo el cursor, o <0 si sale / zona vacía
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    def _tab_at(self, event) -> int:
+        return self.tabAt(event.position().toPoint())
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        if is_pane_drag(event.mimeData()):
+            event.acceptProposedAction()
+            self.paneHoverTab.emit(self._tab_at(event))
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        if is_pane_drag(event.mimeData()):
+            event.acceptProposedAction()
+            self.paneHoverTab.emit(self._tab_at(event))
+            return
+        event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        self.paneHoverTab.emit(-2)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        if not is_pane_drag(event.mimeData()):
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        index = self._tab_at(event)
+        pane = dragging_pane()
+        QTimer.singleShot(0, lambda i=index, p=pane: self.paneDroppedOnTab.emit(i, p))
 
 
 class PromptBar(QLineEdit):
@@ -191,6 +238,18 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         """Tab al agente; resto al terminal seleccionado; Host Key alterna MODO AGENTE."""
+        if watched is getattr(self, "_new_tab_plus", None):
+            etype = event.type()
+            if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if is_pane_drag(event.mimeData()):
+                    event.acceptProposedAction()
+                    return True
+            elif etype == QEvent.Type.Drop and is_pane_drag(event.mimeData()):
+                pane = dragging_pane()
+                event.acceptProposedAction()
+                if pane is not None:
+                    QTimer.singleShot(0, lambda p=pane: self._move_pane_to_tab(p, -1))
+                return True
         if event.type() != QEvent.Type.KeyPress:
             return super().eventFilter(watched, event)
 
@@ -294,6 +353,9 @@ class MainWindow(QMainWindow):
         self.act_close_pane = self._act("close_pane", "Cerrar panel", self.close_pane)
         self.act_close_tab = self._act("close_tab", "Cerrar pestaña", self.close_tab)
         self.act_rename_tab = self._act("rename_tab", "Renombrar pestaña", self.rename_tab)
+        self.act_move_pane = self._act(
+            "move_pane", "Mover panel a otra pestaña…", self.move_pane
+        )
         self.act_next_tab = self._act("next_tab", "Pestaña siguiente", lambda: self._cycle_tab(1))
         self.act_prev_tab = self._act("prev_tab", "Pestaña anterior", lambda: self._cycle_tab(-1))
         self.act_quit = self._act("quit", "Salir", self.close)
@@ -398,6 +460,12 @@ class MainWindow(QMainWindow):
             "Mueve sus terminales a la pestaña actual para poder verlas juntas"
         )
         self.act_merge_tabs.triggered.connect(self.merge_tabs_into_current)
+        session_menu.addSeparator()
+        self.act_move_pane.setToolTip(
+            "Mueve el panel activo (o el que elijas) a otra pestaña o a una nueva. "
+            "El proceso sigue vivo. También puedes arrastrar la cabecera del panel."
+        )
+        session_menu.addAction(self.act_move_pane)
         session_menu.addSeparator()
         session_menu.addAction(self.act_quit)
 
@@ -531,6 +599,7 @@ class MainWindow(QMainWindow):
         more_menu = QMenu(more)
         more_menu.addAction(self.act_new_ssh)
         more_menu.addAction(self.act_merge_tabs)
+        more_menu.addAction(self.act_move_pane)
         more_menu.addAction(self.act_restart)
         more_menu.addSeparator()
         more_menu.addAction(self.act_sudo)
@@ -562,22 +631,36 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self) -> None:
         self.tabs = QTabWidget(self)
+        tab_bar = PaneDropTabBar(self.tabs)
+        self.tabs.setTabBar(tab_bar)
         self.tabs.setTabsClosable(True)
         self.tabs.setMovable(True)
         self.tabs.setDocumentMode(True)
-        self.tabs.tabBar().setExpanding(False)
-        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        tab_bar.setExpanding(False)
+        tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
         self.tabs.tabCloseRequested.connect(self.close_tab_at)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._pane_tab_hover = -1
+        self._pane_tab_timer = QTimer(self)
+        self._pane_tab_timer.setSingleShot(True)
+        self._pane_tab_timer.timeout.connect(self._switch_hovered_tab)
+        tab_bar.paneHoverTab.connect(self._on_pane_hover_tab)
+        tab_bar.paneDroppedOnTab.connect(self._on_pane_dropped_on_tab)
 
         plus = QToolButton()
         plus.setObjectName("IconButton")
         plus.setText("＋")
-        plus.setToolTip(f"Nueva pestaña ({self._shortcuts.get('new_tab', '')})")
+        plus.setToolTip(
+            f"Nueva pestaña ({self._shortcuts.get('new_tab', '')}). "
+            "También puedes soltar aquí un panel arrastrado."
+        )
         plus.setFixedSize(28, 28)
         plus.setAutoRaise(True)
         plus.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        plus.setAcceptDrops(True)
         plus.clicked.connect(lambda: self.choose_agent(new_tab=True))
+        plus.installEventFilter(self)
+        self._new_tab_plus = plus
         self.tabs.setCornerWidget(plus, Qt.Corner.TopRightCorner)
 
         holder = QWidget(self)
@@ -818,6 +901,7 @@ class MainWindow(QMainWindow):
         workspace.userFocusRequested.connect(self._exit_host_mode)
         workspace.directoryDropped.connect(self.assign_directory_to_pane)
         workspace.filesDropped.connect(self._on_files_dropped)
+        workspace.paneMoveDropped.connect(self._on_pane_move_drop)
         workspace.set_agent_mode(self._agent_mode)
         index = self.tabs.addTab(workspace, title)
         self.tabs.setCurrentIndex(index)
@@ -870,7 +954,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ SSH
     def choose_ssh(self, preset: str = "") -> None:
         """Diálogo para conectar por SSH a un equipo remoto y abrir su terminal."""
-        dialog = SshDialog(self.config.ssh_hosts, self, preset=preset)
+        dialog = SshDialog(
+            self.config.ssh_hosts,
+            self,
+            preset=preset,
+            agents=self.config.agents,
+            default_agent=self.settings.default_agent,
+        )
         if dialog.exec() != SshDialog.DialogCode.Accepted:
             return
         host = dialog.result_host()
@@ -883,18 +973,77 @@ class MainWindow(QMainWindow):
             saved.append(host)
         self.config.ssh_hosts = saved
         self.config.save()
-        self.open_ssh(host)
+        remote = dialog.chosen_remote_agent()
+        if dialog.wants_provision():
+            self.provision_ssh(host, remote)
+            return
+        self.open_ssh(host, remote)
 
-    def open_ssh(self, host: SshHost) -> None:
+    def _remote_for_host(self, host: SshHost, remote: Agent | None = None) -> Agent | None:
+        if remote is not None:
+            return remote
+        if host.remote_agent:
+            return find_agent(self.config.agents, host.remote_agent)
+        return None
+
+    def open_ssh(self, host: SshHost, remote: Agent | None = None) -> None:
         """Abre una sesión SSH en una pestaña nueva (una terminal real por conexión)."""
         if host is None or not host.host:
             return
-        agent = host.to_agent()
+        remote = self._remote_for_host(host, remote)
+        agent = host.to_agent(remote)
         self.new_tab(agent, self.settings.start_dir)
+        what = remote.name if remote is not None and remote.id != "shell" else "sesión"
         self.statusBar().showMessage(
-            f"Conectando por SSH a {host.target}:{int(host.port)}…", 6000
+            f"Conectando por SSH a {host.target}:{int(host.port)} · {what}…", 6000
         )
         self._update_status()
+
+    def provision_ssh(self, host: SshHost, remote: Agent | None = None) -> None:
+        """Copia la clave pública al equipo y, si va bien, abre el agente elegido."""
+        if host is None or not host.host:
+            return
+        remote = self._remote_for_host(host, remote)
+        workspace = self.new_tab(host.provision_agent(), self.settings.start_dir)
+        pane = workspace.active_pane()
+        if pane is None:
+            return
+        self.statusBar().showMessage(
+            f"Escribe la contraseña de {host.target} para copiar la clave. "
+            "Al terminar se abrirá el agente seleccionado.",
+            12000,
+        )
+        self._update_status()
+
+        def _after_provision(exited_pane, h=host, r=remote) -> None:
+            code = exited_pane.session.returncode if exited_pane.session else None
+            if code != 0:
+                self.statusBar().showMessage(
+                    f"No se copió la clave SSH (código {code}). "
+                    "Revisa usuario, host o contraseña y pulsa ↻ para reintentar.",
+                    10000,
+                )
+                return
+            try:
+                exited_pane.exited.disconnect(_after_provision)
+            except (RuntimeError, TypeError):
+                pass
+            next_agent = h.to_agent(r)
+            exited_pane.agent = next_agent
+            exited_pane.title = next_agent.name
+            exited_pane.name_label.setText(next_agent.name)
+            exited_pane.dot.setStyleSheet(
+                f"color: {next_agent.color}; font-size: 11px;"
+            )
+            exited_pane.restart()
+            what = r.name if r is not None and r.id != "shell" else "sesión"
+            self.statusBar().showMessage(
+                f"Clave copiada. Abriendo {what} en {h.target}…",
+                8000,
+            )
+            self._update_status()
+
+        pane.exited.connect(_after_provision)
 
     def close_pane(self) -> None:
         workspace = self.workspace()
@@ -950,6 +1099,123 @@ class MainWindow(QMainWindow):
                 f"{moved} terminal(es) añadida(s) al mosaico. Ahora usa Diseño para elegir 1, 2 o todas.",
                 6000,
             )
+
+    def _workspace_of(self, pane) -> WorkspaceWidget | None:
+        """Pestaña que contains the panel (or None if it doesn't belong to any)."""
+        for workspace in self._workspaces():
+            if isinstance(workspace, WorkspaceWidget) and pane in workspace.panes():
+                return workspace
+        return None
+
+    def move_pane(self) -> None:
+        """Move a panel from the current pestaña to another (or to a new one)."""
+        source = self.workspace()
+        if source is None or source.count() == 0:
+            return
+        current = self.tabs.currentIndex()
+        others = []
+        for index in range(self.tabs.count()):
+            if index == current:
+                continue
+            workspace = self.tabs.widget(index)
+            if not isinstance(workspace, WorkspaceWidget):
+                continue
+            others.append((index, self.tabs.tabText(index) or f"Pestaña {index + 1}"))
+        dialog = MovePaneDialog(source.panes(), others, self, active=source.active_pane())
+        if dialog.exec() != MovePaneDialog.DialogCode.Accepted:
+            return
+        pane = dialog.chosen_pane()
+        if pane is None:
+            return
+        self._move_pane_to_tab(pane, dialog.chosen_target())
+
+    def _move_pane_to_tab(self, pane, target_index: int) -> None:
+        """Mueve el panel a la pestaña indicada (-1 = nueva), sin terminar su proceso."""
+        source = self._workspace_of(pane)
+        if source is None:
+            return
+        if target_index < 0:
+            target = self.add_workspace("Sesión")
+            self._place_pane(pane, target, 0)
+            return
+        target = self.tabs.widget(target_index)
+        if not isinstance(target, WorkspaceWidget):
+            return
+        self._place_pane(pane, target, target.count())
+
+    def _place_pane(self, pane, target: WorkspaceWidget, index: int) -> None:
+        """Coloca el panel en `target` en la posición `index`, vivo."""
+        source = self._workspace_of(pane)
+        if source is None or not isinstance(target, WorkspaceWidget):
+            return
+        if source is target:
+            target.reorder_pane(pane, index)
+            self._update_status()
+            return
+        moved = source.detach_pane(pane)
+        if moved is None:
+            return
+        target.adopt_panes([moved], focus=True, index=index)
+        if source.count() == 0 and self.tabs.count() > 1:
+            self._remove_workspace(source)
+        tab_index = self.tabs.indexOf(target)
+        if tab_index >= 0:
+            self.tabs.setCurrentIndex(tab_index)
+        if not self._host_mode:
+            target.focus_terminal()
+        self._update_status()
+        self.statusBar().showMessage(
+            f"Panel «{pane.agent.name}» movido a otra pestaña. El proceso sigue vivo.",
+            5000,
+        )
+
+    def _on_pane_move_drop(self, source, target, edge: str) -> None:
+        """Suelta un panel sobre otro (reordena) o sobre una pestaña vacía (al final)."""
+        if target is not None:
+            target_ws = self._workspace_of(target)
+        else:
+            sender = self.sender()
+            target_ws = sender if isinstance(sender, WorkspaceWidget) else self.workspace()
+        if not isinstance(target_ws, WorkspaceWidget) or source is None:
+            return
+        if target is not None and target in target_ws.panes():
+            index = target_ws.panes().index(target)
+            if edge in ("right", "bottom"):
+                index += 1
+        else:
+            index = target_ws.count()
+        self._place_pane(source, target_ws, index)
+
+    def _on_pane_hover_tab(self, index: int) -> None:
+        if index < 0:
+            self._pane_tab_timer.stop()
+            self._pane_tab_hover = -1
+            return
+        if index == self.tabs.currentIndex():
+            self._pane_tab_timer.stop()
+            self._pane_tab_hover = index
+            return
+        if index != self._pane_tab_hover:
+            self._pane_tab_hover = index
+            self._pane_tab_timer.start(TAB_HOVER_SWITCH_MS)
+
+    def _switch_hovered_tab(self) -> None:
+        index = self._pane_tab_hover
+        if 0 <= index < self.tabs.count():
+            self.tabs.setCurrentIndex(index)
+
+    def _on_pane_dropped_on_tab(self, index: int, pane=None) -> None:
+        pane = pane if pane is not None else dragging_pane()
+        if pane is None:
+            return
+        if index < 0:
+            self._move_pane_to_tab(pane, -1)
+            return
+        source = self._workspace_of(pane)
+        target = self.tabs.widget(index)
+        if source is target:
+            return
+        self._move_pane_to_tab(pane, index)
 
     def rename_tab(self) -> None:
         workspace = self.workspace()

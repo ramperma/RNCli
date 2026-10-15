@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 from .agents import Agent
-from .pane import PaneWidget
+from .pane import PaneWidget, dragging_pane
 from .theme import theme
 
 #: Diseño -> número máximo de paneles visibles (None = todos).
@@ -60,6 +60,7 @@ class WorkspaceWidget(QWidget):
     userFocusRequested = Signal(object)
     directoryDropped = Signal(object, str)
     filesDropped = Signal(object, list)
+    paneMoveDropped = Signal(object, object, str)
 
     def __init__(self, settings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -90,6 +91,7 @@ class WorkspaceWidget(QWidget):
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._placeholder.setObjectName("Placeholder")
         self._placeholder.setVisible(False)
+        self.setAcceptDrops(True)
 
     # ------------------------------------------------------------------ consultas
     def panes(self) -> list[PaneWidget]:
@@ -130,7 +132,7 @@ class WorkspaceWidget(QWidget):
         self._update_title()
         return pane
 
-    def _adopt_pane(self, pane: PaneWidget, focus: bool = True) -> None:
+    def _adopt_pane(self, pane: PaneWidget, focus: bool = True, index: int | None = None) -> None:
         """Añade un panel existente (usado al convertir pestañas en paneles)."""
         pane.setParent(self._host)
         pane.closeRequested.connect(self.close_pane)
@@ -141,47 +143,95 @@ class WorkspaceWidget(QWidget):
         pane.userFocusRequested.connect(self._on_user_focus)
         pane.directoryDropped.connect(self._on_directory_drop)
         pane.filesDropped.connect(self._on_files_drop)
+        pane.paneMoveDropped.connect(self._on_pane_move_drop)
         if pane.terminal is not None:
             pane.terminal.agent_mode = self.agent_mode
-        self._panes.append(pane)
+        if index is None or index >= len(self._panes):
+            self._panes.append(pane)
+            placed = len(self._panes) - 1
+        else:
+            self._panes.insert(max(0, index), pane)
+            placed = self._panes.index(pane)
         if focus:
-            self._active = len(self._panes) - 1
+            self._active = placed
 
-    def adopt_panes(self, panes: list[PaneWidget], focus: bool = False) -> None:
+    def adopt_panes(
+        self, panes: list[PaneWidget], focus: bool = False, index: int | None = None
+    ) -> None:
         """Mueve paneles vivos desde otra pestaña a esta pestaña."""
-        for pane in panes:
-            self._adopt_pane(pane, focus=focus)
-        if focus:
-            self._active = max(0, len(self._panes) - 1)
+        for offset, pane in enumerate(panes):
+            at = None if index is None else index + offset
+            self._adopt_pane(pane, focus=focus, index=at)
+        if focus and self._panes:
+            self._active = (
+                len(self._panes) - 1 if index is None else min(index + len(panes) - 1, len(self._panes) - 1)
+            )
         self._rebuild()
         self.panesChanged.emit()
         self._update_title()
 
+    def reorder_pane(self, pane: PaneWidget, index: int) -> None:
+        """Coloca el panel en `index` (como inserción: 0 = primero, count = último)."""
+        if pane not in self._panes:
+            return
+        current = self._panes.index(pane)
+        index = max(0, min(int(index), len(self._panes)))
+        if index == current or index == current + 1:
+            return
+        self._panes.pop(current)
+        if index > current:
+            index -= 1
+        self._panes.insert(index, pane)
+        self._active = index
+        self._rebuild()
+        self.panesChanged.emit()
+        self._update_title()
+        self.activeChanged.emit(self.active_pane())
+        self._focus_terminal()
+
+    def _disconnect_pane(self, pane: PaneWidget) -> None:
+        """Desplaza un panel de la signals de esta pestaña sin terminar su proceso."""
+        for signal, slot in (
+            (pane.closeRequested, self.close_pane),
+            (pane.focusRequested, self.focus_pane),
+            (pane.exited, self._on_pane_exited),
+            (pane.inputReady, self.on_terminal_input),
+            (pane.hostKeyRequested, self._on_host_key),
+            (pane.userFocusRequested, self._on_user_focus),
+            (pane.directoryDropped, self._on_directory_drop),
+            (pane.filesDropped, self._on_files_drop),
+            (pane.paneMoveDropped, self._on_pane_move_drop),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        pane.hide()
+        pane.setParent(None)
+
     def detach_panes(self) -> list[PaneWidget]:
-        """Desconecta y entrega los paneles sin terminar sus procesos."""
+        """Desconecta y entrega los paneles sin terminar sus processes."""
         panes = list(self._panes)
         self._panes.clear()
         for pane in panes:
-            for signal, slot in (
-                (pane.closeRequested, self.close_pane),
-                (pane.focusRequested, self.focus_pane),
-                (pane.exited, self._on_pane_exited),
-                (pane.inputReady, self.on_terminal_input),
-                (pane.hostKeyRequested, self._on_host_key),
-                (pane.userFocusRequested, self._on_user_focus),
-                (pane.directoryDropped, self._on_directory_drop),
-                (pane.filesDropped, self._on_files_drop),
-            ):
-                try:
-                    signal.disconnect(slot)
-                except (RuntimeError, TypeError):
-                    pass
-            pane.hide()
-            pane.setParent(None)
+            self._disconnect_pane(pane)
         self._rebuild()
         self.panesChanged.emit()
         self._update_title()
         return panes
+
+    def detach_pane(self, pane: PaneWidget) -> PaneWidget | None:
+        """Desconecta and hand over a single pane, without ending its process."""
+        if pane not in self._panes:
+            return None
+        self._panes.remove(pane)
+        self._disconnect_pane(pane)
+        self._active = min(self._active, max(0, len(self._panes) - 1))
+        self._rebuild()
+        self.panesChanged.emit()
+        self._update_title()
+        self.activeChanged.emit(self.active_pane())
+        return pane
 
     def close_pane(self, pane: PaneWidget) -> None:
         if pane not in self._panes:
@@ -280,6 +330,31 @@ class WorkspaceWidget(QWidget):
     def _on_files_drop(self, pane: PaneWidget, paths: list) -> None:
         if pane in self._panes:
             self.filesDropped.emit(pane, list(paths))
+
+    def _on_pane_move_drop(self, source: PaneWidget, target: PaneWidget | None, edge: str) -> None:
+        self.paneMoveDropped.emit(source, target, edge)
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        source = dragging_pane()
+        if source is not None and source not in self._panes:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        source = dragging_pane()
+        if source is not None and source not in self._panes:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        source = dragging_pane()
+        if source is None or source in self._panes:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        QTimer.singleShot(0, lambda s=source: self.paneMoveDropped.emit(s, None, "append"))
 
     # ------------------------------------------------------------------ diseño
     def set_layout(self, mode: str) -> None:

@@ -53,8 +53,9 @@ from .config import (
     merged_shortcuts,
 )
 from .layouts import LAYOUT_LABELS
+from .pane import PaneWidget
 from .shell_env import reset_cache, resolve_executable
-from .ssh_hosts import SshHost
+from .ssh_hosts import SshHost, ensure_ssh_identity
 from .theme import THEME_LABELS
 
 MD_GUIDE = Path(__file__).resolve().parents[1] / "sudo-config-strategies.md"
@@ -651,17 +652,177 @@ class AgentChooserDialog(QDialog):
         return self._ssh
 
 
+# ---------------------------------------------------------------------- move pane
+class MovePaneDialog(QDialog):
+    """Move a panel from the current tab to another tab (or to a new one)."""
+
+    def __init__(
+        self,
+        panes: list,
+        tabs: list[tuple[int, str]],
+        parent=None,
+        active=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} · move panel")
+        self.setMinimumWidth(560)
+        self._panes = list(panes)
+        self._tabs = list(tabs)
+        self._selected: PaneWidget | None = active if active in self._panes else None
+        if self._selected is None and self._panes:
+            self._selected = self._panes[0]
+        self._target: int = self._tabs[0][0] if self._tabs else -1
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 16)
+        root.setSpacing(14)
+
+        header = QLabel("¿Which panel to move, and where?")
+        header.setStyleSheet("font-size: 16px; font-weight: 600;")
+        root.addWidget(header)
+        hint = QLabel(
+            "Choose a panel and a tab (the ● is the active one). "
+            "The process stays alive during the move. Esc to cancel."
+        )
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        root.addWidget(self._section("Panel to move"))
+        self._pane_grid = QGridLayout()
+        self._pane_grid.setSpacing(10)
+        root.addLayout(self._pane_grid)
+        self._reload_pane_grid()
+
+        root.addWidget(self._section("Move to"))
+        self._tab_grid = QGridLayout()
+        self._tab_grid.setSpacing(10)
+        root.addLayout(self._tab_grid)
+        self._reload_tab_grid()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    @staticmethod
+    def _section(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setStyleSheet("font-weight: 600;")
+        return label
+
+    def _reload_pane_grid(self) -> None:
+        while self._pane_grid.count():
+            item = self._pane_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, pane in enumerate(self._panes):
+            button = QToolButton()
+            button.setObjectName("AgentButton")
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            prefix = f"{index + 1}. " if index < 9 else ""
+            mark = "  ·  active" if pane is self._selected else ""
+            folder = os.path.basename((pane.shell_cwd() or pane.cwd).rstrip(os.sep))
+            button.setText(f"{prefix}{pane.agent.emoji}  {pane.agent.name}\n{folder}{mark}")
+            button.setToolTip(
+                f"{pane.agent.name} · {pane.shell_cwd() or pane.cwd}\n"
+                "Haz clic to choose the panel to move."
+            )
+            button.setMinimumHeight(56)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _=False, p=pane: self._choose_pane(p))
+            self._pane_grid.addWidget(button, index // 3, index % 3)
+
+    def _reload_tab_grid(self) -> None:
+        while self._tab_grid.count():
+            item = self._tab_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, (tab_index, label) in enumerate(self._tabs):
+            button = QToolButton()
+            button.setObjectName("AgentButton")
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            letter = chr(ord("A") + index) if index < 8 else ""
+            prefix = f"{letter}. " if letter else ""
+            button.setText(f"{prefix}{label}")
+            button.setToolTip(f"Tab «{label}»\nHaz clic to choose the destination.")
+            button.setMinimumHeight(56)
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _=False, i=tab_index: self._choose_target(i))
+            self._tab_grid.addWidget(button, index // 3, index % 3)
+        new_tab = QToolButton()
+        new_tab.setObjectName("AgentButton")
+        new_tab.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        new_tab.setText("＋  New tab")
+        new_tab.setToolTip("Move the panel to a new tab (a new session).")
+        new_tab.setMinimumHeight(56)
+        new_tab.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        new_tab.clicked.connect(lambda: self._choose_target(-1))
+        count = len(self._tabs)
+        self._tab_grid.addWidget(new_tab, count // 3, count % 3)
+
+    def _choose_pane(self, pane: PaneWidget) -> None:
+        self._selected = pane
+        self._refresh_marks()
+
+    def _choose_target(self, index: int) -> None:
+        self._target = int(index)
+
+    def _refresh_marks(self) -> None:
+        """Repaint the ● so the chosen panel is visible in its button."""
+        self._reload_pane_grid()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        key = event.key()
+        if Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
+            index = key - Qt.Key.Key_1
+            if 0 <= index < len(self._panes):
+                self._choose_pane(self._panes[index])
+                return
+        if Qt.Key.Key_A <= key <= Qt.Key.Key_H:
+            index = key - Qt.Key.Key_A
+            if index < len(self._tabs):
+                self._choose_target(self._tabs[index][0])
+                return
+            if index == len(self._tabs):
+                self._choose_target(-1)  # next letter after the tabs: new tab
+                return
+        super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ salida
+    def chosen_pane(self) -> PaneWidget | None:
+        return self._selected
+
+    def chosen_target(self) -> int:
+        """Index of the destination tab, or -1 for a new tab."""
+        return self._target
+
+
 # --------------------------------------------------------------------------- SSH
 class SshDialog(QDialog):
     """Configura (y opcionalmente guarda) una conexión SSH a un equipo remoto."""
 
-    def __init__(self, hosts: list[SshHost], parent=None, preset: str = "") -> None:
+    def __init__(
+        self,
+        hosts: list[SshHost],
+        parent=None,
+        preset: str = "",
+        agents: list[Agent] | None = None,
+        default_agent: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} · conexión SSH")
         self.setMinimumWidth(560)
         self._hosts = list(hosts)
+        self._agents = list(agents or [])
+        self._default_agent = (default_agent or "").strip()
         self._removed: list[SshHost] = []
         self._result: SshHost | None = None
+        self._provision = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 16)
@@ -670,8 +831,9 @@ class SshDialog(QDialog):
         title.setStyleSheet("font-size: 16px; font-weight: 600;")
         root.addWidget(title)
         hint = QLabel(
-            "La sesión se abre en un panel (terminal real): podrás ejecutar comandos, "
-            "agentes o transferir archivos en la máquina remota."
+            "Elige el agente que quieres abrir en el equipo remoto. "
+            "«Provisionar clave SSH» copia tu clave pública (ssh-copy-id) para "
+            "entrar sin contraseña y, al terminar, lanza ese agente."
         )
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
@@ -720,11 +882,19 @@ class SshDialog(QDialog):
         self.keepalive_check.setChecked(True)
         self.keepalive_check.setToolTip("Envía un latido cada 30 s para detectar caídas de red.")
 
+        self.agent_combo = QComboBox()
+        self.agent_combo.setToolTip(
+            "Tras conectar (o al terminar de copiar la clave) se lanza este agente "
+            "en la máquina remota. «Solo shell» deja una sesión de login."
+        )
+        self._reload_agent_combo(self._default_agent)
+
         form.addRow("Nombre", self.name_edit)
         form.addRow("Usuario", self.user_edit)
         form.addRow("Host", self.host_edit)
         form.addRow("Puerto", self.port_spin)
         form.addRow("Clave privada", identity_box)
+        form.addRow("Agente remoto", self.agent_combo)
         form.addRow("Opciones de ssh", self.options_edit)
         form.addRow("", self.keepalive_check)
         root.addLayout(form)
@@ -743,12 +913,24 @@ class SshDialog(QDialog):
         buttons.accepted.connect(self._connect)
         buttons.rejected.connect(self.reject)
 
+        self.status = QLabel("")
+        self.status.setObjectName("Hint")
+        self.status.setWordWrap(True)
+        root.addWidget(self.status)
+
         row = QHBoxLayout()
         self.delete_button = QPushButton("Eliminar guardado")
         self.delete_button.setToolTip("Quita el equipo seleccionado de la lista")
         self.delete_button.clicked.connect(self._delete_saved)
         self.delete_button.setEnabled(bool(self._hosts))
         row.addWidget(self.delete_button)
+        self.provision_button = QPushButton("🔑 Provisionar clave SSH")
+        self.provision_button.setToolTip(
+            "Crea la clave si no existe, la copia al equipo (ssh-copy-id) y, "
+            "cuando acepte la contraseña, abre el agente seleccionado."
+        )
+        self.provision_button.clicked.connect(self._provision_key)
+        row.addWidget(self.provision_button)
         row.addStretch(1)
         row.addWidget(buttons)
         root.addLayout(row)
@@ -789,6 +971,7 @@ class SshDialog(QDialog):
         self.identity_edit.setText(host.identity)
         self.options_edit.setText(" ".join(host.options))
         self.keepalive_check.setChecked(host.keepalive)
+        self._select_remote_agent(host.remote_agent or self._default_agent)
 
     def _apply_preset(self, preset: str) -> None:
         host = SshHost.parse(preset)
@@ -813,6 +996,20 @@ class SshDialog(QDialog):
         if chosen:
             self.identity_edit.setText(chosen)
 
+    def _reload_agent_combo(self, selected_id: str = "") -> None:
+        self.agent_combo.blockSignals(True)
+        self.agent_combo.clear()
+        self.agent_combo.addItem("— Solo shell (login remoto) —", "")
+        for agent in self._agents:
+            self.agent_combo.addItem(f"{agent.emoji} {agent.name}", agent.id)
+        self.agent_combo.blockSignals(False)
+        self._select_remote_agent(selected_id)
+
+    def _select_remote_agent(self, agent_id: str) -> None:
+        key = (agent_id or "").strip()
+        index = self.agent_combo.findData(key)
+        self.agent_combo.setCurrentIndex(max(0, index))
+
     def _build_host(self) -> SshHost | None:
         host = self.host_edit.text().strip()
         if not host:
@@ -826,14 +1023,40 @@ class SshDialog(QDialog):
             options=options,
             name=self.name_edit.text().strip(),
             keepalive=self.keepalive_check.isChecked(),
+            remote_agent=str(self.agent_combo.currentData() or ""),
         )
 
     def _connect(self) -> None:
         host = self._build_host()
         if host is None:
             self.host_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.status.setText("Indica el host al que conectar.")
             return
+        self._provision = False
         self._result = host
+        self.accept()
+
+    def _provision_key(self) -> None:
+        host = self._build_host()
+        if host is None:
+            self.host_edit.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.status.setText("Indica el host al que copiar la clave.")
+            return
+        try:
+            path, message = ensure_ssh_identity(host.identity)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Clave SSH",
+                f"No se pudo crear o localizar la clave privada:\n{exc}",
+            )
+            return
+        self.identity_edit.setText(path)
+        host.identity = path
+        self._provision = True
+        self._result = host
+        if message:
+            self.status.setText(message)
         self.accept()
 
     # ------------------------------------------------------------------ salida
@@ -842,6 +1065,18 @@ class SshDialog(QDialog):
 
     def wants_save(self) -> bool:
         return self.save_check.isChecked() and self._result is not None
+
+    def wants_provision(self) -> bool:
+        return self._provision and self._result is not None
+
+    def chosen_remote_agent(self) -> Agent | None:
+        agent_id = str(self.agent_combo.currentData() or "")
+        if not agent_id:
+            return None
+        for agent in self._agents:
+            if agent.id == agent_id:
+                return agent
+        return None
 
     def removed_hosts(self) -> list[SshHost]:
         return list(self._removed)
@@ -1119,6 +1354,8 @@ class ShortcutsDialog(QDialog):
     """Ayuda F1: la tabla de atajos del chasis se genera desde la configuración."""
 
     STATIC_ROWS: ClassVar[list[tuple[str, str | None]]] = [
+        ("Paneles", None),
+        ("Arrastrar cabecera del panel", "Reordenar en la pestaña o soltar en otra pestaña (el proceso sigue vivo)"),
         ("Terminal", None),
         ("Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+A", "Copiar / pegar / seleccionar todo (apagados en MODO AGENTE)"),
         ("Tab / Shift+Tab", "Siempre al terminal seleccionado (cursor-agent, Pi…)"),
