@@ -7,20 +7,29 @@ completo de ``ssh`` con puerto, identidad y opciones.
 
 También se puede **provisionar la clave** (``ssh-copy-id``) para entrar sin
 contraseña y lanzar un agente concreto en la máquina remota.
+
+Cada conexión comparte un **socket de control** (``ControlPath``): el panel SSH
+es el patrón de la conexión y las órdenes de apoyo (el explorador de archivos
+remoto, las sondas) reutilizan la sesión ya autenticada en vez de volver a
+negociar clave, alias de ``ssh_config`` o 2FA.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 
 from .agents import Agent
 
 DEFAULT_PORT = 22
 DEFAULT_IDENTITY = "~/.ssh/id_ed25519"
+#: El socket de control viaja por un socket de unix: sun_path admite ~108 bytes.
+CONTROL_SOCKET_LIMIT = 100
 CANDIDATE_IDENTITIES = (
     "~/.ssh/id_ed25519",
     "~/.ssh/id_ecdsa",
@@ -31,6 +40,50 @@ _LOGIN_SHELLS = {"bash", "zsh", "fish", "sh"}
 
 def _clean(value: str) -> str:
     return (value or "").strip()
+
+
+#: ``~`` o ``~usuario`` (la parte que la shell remota sí expande sin comillas).
+_TILDE_HEAD = re.compile(r"^~[A-Za-z0-9._-]*$")
+
+
+def remote_path_expr(path: str) -> str:
+    """Expresión de shell para una ruta remota que expande ``~`` en el equipo.
+
+    ``shlex.quote("~")`` daría ``'~'`` y ``cd`` no expandiría la tilde («No
+    such file or directory»). Por eso la tilde se deja sin comillas y solo se
+    entrecomilla el resto de la ruta.
+    """
+    text = _clean(path) or "~"
+    if not text.startswith("~"):
+        return shlex.quote(text)
+    head, slash, rest = text.partition("/")
+    if not _TILDE_HEAD.match(head):
+        return shlex.quote(text)  # «~» con caracteres raros: se cita entero
+    if not slash:
+        return head
+    return f"{head}/{shlex.quote(rest)}"
+
+
+def control_socket_dir() -> str:
+    """Directorio de los sockets de control (creado con permiso 700)."""
+    base = _clean(os.environ.get("XDG_CACHE_HOME", "")) or os.path.expanduser("~/.cache")
+    candidates = [os.path.join(base, "rncli", "ssh")]
+    if not candidates[0] or len(candidates[0]) > CONTROL_SOCKET_LIMIT:
+        # %C añade un hash de ~40 caracteres: si la base ya es larga, el socket
+        # no cabría en sun_path y ssh fallaría al conectar. Usamos /tmp/vdsock.
+        candidates.append(os.path.join(tempfile.gettempdir(), f"rncli-ssh-{os.getuid()}"))
+    for path in candidates:
+        try:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return os.path.expanduser("~")
+
+
+def control_socket_pattern() -> str:
+    """``ControlPath`` con el hash de la conexión (%C): corto y sin colisiones."""
+    return os.path.join(control_socket_dir(), "%C")
 
 
 def resolve_identity(identity: str = "") -> str:
@@ -115,11 +168,11 @@ class SshHost:
     host: str = ""
     user: str = ""
     port: int = DEFAULT_PORT
-    identity: str = ""                 # ruta a la clave privada (-i)
+    identity: str = ""  # ruta a la clave privada (-i)
     options: list[str] = field(default_factory=list)  # opciones extra
-    name: str = ""                     # etiqueta visible
-    keepalive: bool = True             # ServerAliveInterval para detectar caídas
-    remote_agent: str = ""             # id del agente a lanzar en remoto (vacío = shell)
+    name: str = ""  # etiqueta visible
+    keepalive: bool = True  # ServerAliveInterval para detectar caídas
+    remote_agent: str = ""  # id del agente a lanzar en remoto (vacío = shell)
 
     # ------------------------------------------------------------------ utilidades
     @property
@@ -142,12 +195,25 @@ class SshHost:
             argv += ["-p", str(port)]
         if self.keepalive:
             argv += [
-                "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=4",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=4",
             ]
         identity = _clean(self.identity)
         if identity:
             argv += ["-i", os.path.expanduser(identity)]
+        # Multiplexación: el primer panel abre la conexión (maestro) y el resto
+        # de órdenes hacia el mismo equipo viajan por ese socket. Van antes de
+        # las opciones del usuario para que él pueda sobrescribirlas.
+        argv += [
+            "-o",
+            f"ControlPath={control_socket_pattern()}",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPersist=300",
+        ]
         for option in self.options:
             option = _clean(option)
             if not option:
@@ -190,16 +256,16 @@ class SshHost:
                 argv += ["-p", str(port)]
             if self.keepalive:
                 argv += [
-                    "-o", "ServerAliveInterval=30",
-                    "-o", "ServerAliveCountMax=4",
+                    "-o",
+                    "ServerAliveInterval=30",
+                    "-o",
+                    "ServerAliveCountMax=4",
                 ]
             for option in self.options:
                 option = _clean(option)
                 if not option:
                     continue
-                if option.startswith("-o"):
-                    argv += shlex.split(option)
-                elif option.startswith("-"):
+                if option.startswith("-o") or option.startswith("-"):
                     argv += shlex.split(option)
                 else:
                     argv += ["-o", option]
@@ -209,7 +275,7 @@ class SshHost:
         remote = (
             "umask 077; mkdir -p ~/.ssh; "
             "touch ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys; "
-            "key=$(cat); grep -qxF \"$key\" ~/.ssh/authorized_keys "
+            'key=$(cat); grep -qxF "$key" ~/.ssh/authorized_keys '
             "|| printf '%s\\n' \"$key\" >> ~/.ssh/authorized_keys"
         )
         ssh = " ".join(shlex.quote(part) for part in self.command())
@@ -218,6 +284,56 @@ class SshHost:
             "-lc",
             f"cat {shlex.quote(public)} | {ssh} {shlex.quote(remote)}",
         ]
+
+    # ------------------------------------------------------------------ apoyo remoto
+    def _query_flags(self) -> list[str]:
+        """Flags para órdenes de apoyo: sin TTY, sin colgarse pidiendo contraseña.
+
+        ``BatchMode`` hace que un equipo que exija contraseña falle de inmediato
+        en vez de dejar el explorador esperando una respuesta que nunca llega
+        (quien autoriza es el panel SSH, que es el patrón de la conexión).
+        """
+        return [
+            *self._ssh_flags(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-n",
+        ]
+
+    def listing_command(self, path: str, show_hidden: bool = False) -> list[str]:
+        """argv de ``ssh`` para listar UNA carpeta remota en formato legible.
+
+        Se fuerza ``sh -c`` para no depender de la shell de login del usuario
+        (fish/csh no aceptan ``cd --``) y ``ls -1 -p -b`` porque es POSIX: una
+        entrada por línea, ``/`` al final de cada carpeta y los nombres con
+        caracteres raros escapados en octal. La primera línea es la ruta
+        canónica del directorio (y confirma que existe).
+        """
+        target = path or "~"
+        script = (
+            f"cd -- {remote_path_expr(target)} && pwd -P && "
+            f"ls -1 -p -b{' -A' if show_hidden else ''}"
+        )
+        remote = f"sh -c {shlex.quote(script)}"
+        return ["ssh", *self._query_flags(), "--", self.target, remote]
+
+    def probe_command(self) -> list[str]:
+        """argv de ``ssh`` para saber si el equipo responde (sin abrir un TTY)."""
+        return ["ssh", *self._query_flags(), "--", self.target, "true"]
+
+    def command_with_cwd(self, cwd: str, remote_command: list[str] | None = None) -> list[str]:
+        """argv de ``ssh`` que abre el shell (o el agente) dentro de ``cwd`` remoto.
+
+        Un proceso ssh ya en marcha no puede cambiar su ``cwd`` desde fuera, así
+        que cambiar de carpeta en remoto significa reconectar dentro de ella.
+        """
+        tail = remote_command or ["bash", "-il"]
+        script = f"cd -- {remote_path_expr(cwd)} && exec " + " ".join(
+            shlex.quote(part) for part in tail
+        )
+        return self.command([script])
 
     def to_agent(self, remote: Agent | None = None) -> Agent:
         remote_command: list[str] | None = None
@@ -230,9 +346,7 @@ class SshHost:
                 command=self.command(remote_command),
                 emoji=remote.emoji or "⇄",
                 color=remote.color or "#2dd4bf",
-                description=(
-                    f"{remote.name} en {self.target} por SSH (puerto {int(self.port)})"
-                ),
+                description=(f"{remote.name} en {self.target} por SSH (puerto {int(self.port)})"),
             )
         return Agent(
             id=f"ssh:{self.target}",
@@ -298,7 +412,7 @@ class SshHost:
         if text.startswith("[") and "]" in text:  # IPv6: [::1] o [::1]:2222
             closing = text.find("]")
             host = text[1:closing]
-            rest = text[closing + 1:]
+            rest = text[closing + 1 :]
             if rest.startswith(":") and rest[1:].isdigit():
                 port = int(rest[1:])
         elif text.count(":") == 1:  # host:puerto (IPv4 o nombre)

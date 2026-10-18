@@ -18,7 +18,8 @@ if "RNCLI_CONFIG_DIR" not in os.environ:
     os.environ["RNCLI_CONFIG_DIR"] = tempfile.mkdtemp(prefix="rncli-config-")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from rncli.agents import Agent
@@ -135,6 +136,28 @@ def main() -> int:
             workspace._host_layout.itemAt(0).widget().sizes() == changed_sizes,
             "el divisor conserva la posición elegida por el usuario",
         )
+
+    # Regresión: al maximizar, ocultar la terminal con el foco hace que Qt se
+    # lo pase a otra terminal; el panel maximizado debe seguir siendo el clicado.
+    workspace.set_layout("all")
+    wait(300)
+    from PySide6.QtCore import Qt as _Qt  # main() reimporta Qt más abajo
+    clicked, other = workspace.visible_panes()[:2]
+    QTest.mouseClick(
+        clicked.terminal,
+        _Qt.MouseButton.LeftButton,
+        _Qt.KeyboardModifier.NoModifier,
+        clicked.terminal.rect().center(),
+    )
+    wait(150)
+    workspace.set_layout("1")
+    wait(150)
+    check(
+        workspace.visible_panes() == [clicked] and workspace.active_pane() is clicked,
+        "maximizar muestra el panel clicado, no el que Qt enfocó al ocultar el otro",
+    )
+    workspace.set_layout("all")
+    wait(150)
 
     workspace.set_layout("4")
     check(workspace.broadcast is False, "la difusión está apagada por defecto")
@@ -538,6 +561,92 @@ def main() -> int:
     check(
         any(host.host == "equipo-u" for host in Config.load().ssh_hosts),
         "config.json guarda los equipos SSH",
+    )
+
+    # --- explorador remoto: transporte sin nuevas dependencias -----------------
+    from rncli.remote_fs import RemoteTarget, parse_listing
+
+    fake_listing = "/srv/data\nnotes/\nold report.txt\nback\\\\slash.txt\n"
+    parsed_root, parsed_entries = parse_listing(fake_listing)
+    check(
+        parsed_root == "/srv/data"
+        and [entry.name for entry in parsed_entries]
+        == ["notes", "back\\slash.txt", "old report.txt"]
+        and parsed_entries[0].is_dir
+        and not parsed_entries[1].is_dir
+        and all(entry.path.startswith("/srv/data/") for entry in parsed_entries),
+        "se parsea la salida de ls remoto (carpetas, espacios y escapes octales)",
+    )
+    remote_host = SshHost(host="127.0.0.2", user="root")
+    list_argv = remote_host.listing_command("bin")
+    check(
+        list_argv[:1] == ["ssh"]
+        and "BatchMode=yes" in list_argv
+        and "ls -1 -p -b" in list_argv[-1]
+        and list_argv[-2] == "root@127.0.0.2",
+        "el listado remoto reutiliza ssh sin colgarse pidiendo contraseña",
+    )
+    remote_target = RemoteTarget.from_host(remote_host)
+    check(
+        remote_target.target == "root@127.0.0.2" and remote_target.id == "root@127.0.0.2:22",
+        "RemoteTarget describe el equipo sin duplicar la conexión",
+    )
+    anchor = remote_host.command_with_cwd("/srv/data")
+    check(
+        anchor[:1] == ["ssh"]
+        and "-t" in anchor
+        and "cd -- /srv/data && exec" in anchor[-1],
+        "command_with_cwd re-ancla el panel SSH dentro de una carpeta remota",
+    )
+    # La tilde NO puede ir entrecomillada: ``cd -- '~'`` falla en el equipo
+    # remoto con «No such file or directory» (era el error del explorador).
+    import shlex as _shlex
+    import subprocess as _subprocess
+
+    from rncli.ssh_hosts import remote_path_expr
+
+    check(
+        remote_path_expr("~") == "~"
+        and remote_path_expr("~/docs") == "~/docs"
+        and remote_path_expr("~/mis fotos") == "~/'mis fotos'"
+        and remote_path_expr("/srv/x") == "/srv/x",
+        "la ruta remota deja la tilde sin comillas y cita solo el resto",
+    )
+    home_dir = tempfile.mkdtemp(prefix="rncli-home-")
+    os.makedirs(os.path.join(home_dir, "bin"))
+    os.makedirs(os.path.join(home_dir, "mis fotos"))
+    # ssh concatena los argv remotos y los entrega a la shell de login: se
+    # reproduce tal cual el último argv (no se extrae el script con -1, que
+    # ocultaba que faltaba el ``-c`` y sh abría el script como fichero).
+    home_remote = remote_host.listing_command("~")[-1]
+    check(
+        _shlex.split(home_remote)[:2] == ["sh", "-c"],
+        "el listado remoto se ejecuta con «sh -c» (sin -c, sh busca un fichero)",
+    )
+    home_run = _subprocess.run(
+        ["sh", "-c", home_remote],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": home_dir},
+    )
+    check(
+        home_run.returncode == 0
+        and home_run.stdout.splitlines()[0] == home_dir
+        and "bin/" in home_run.stdout
+        and "mis\\ fotos/" in home_run.stdout,
+        "el listado de «~» se expande y llega al HOME del equipo remoto",
+    )
+    spaced_remote = remote_host.listing_command("~/mis fotos")[-1]
+    spaced_run = _subprocess.run(
+        ["sh", "-c", spaced_remote],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": home_dir},
+    )
+    check(
+        spaced_run.returncode == 0
+        and spaced_run.stdout.splitlines()[0] == os.path.join(home_dir, "mis fotos"),
+        "el listado de una carpeta remota con espacios también funciona",
     )
 
     from rncli.dialogs import SshDialog
@@ -1087,6 +1196,37 @@ def main() -> int:
         and not window.settings.show_hidden_files,
         "se pueden volver a ocultar los archivos ocultos",
     )
+
+    # --- explorador remoto: carga el tree del PC del panel activo --------------
+    config.ssh_hosts = [*config.ssh_hosts, remote_host]
+    remote_pane = window.workspace().active_pane()
+    remote_pane.agent = remote_host.to_agent()
+    window.file_browser.remote_button.click()
+    wait(2000)
+    check(
+        window.file_browser.remote_mode
+        and window.file_browser.remote_tree.isVisible()
+        and not window.file_browser.tree.isVisible(),
+        "el botón carga el árbol de archivos del PC del panel activo",
+    )
+    check(
+        window.file_browser.remote_button.text() == window.file_browser._LOCAL_TEXT
+        and window.file_browser.remote_button.isChecked(),
+        "el botón cambia de texto y queda marcado en modo remoto",
+    )
+    check(
+        bool(window.file_browser.remote_model.error),
+        "un equipo inalcanzable se avisa sin colgarse el explorador",
+    )
+    window.file_browser.remote_button.click()
+    check(
+        not window.file_browser.remote_mode
+        and window.file_browser.tree.isVisible()
+        and window.file_browser.remote_button.text() == window.file_browser._REMOTE_TEXT
+        and not window.file_browser.remote_button.isChecked(),
+        "el botón otra vez vuelve al árbol local y recupera su texto",
+    )
+    remote_pane.agent = shell
 
     tmpdir = tempfile.mkdtemp(prefix="rncli-drop-")
     samples = {

@@ -73,6 +73,7 @@ class WorkspaceWidget(QWidget):
 
         self._panes: list[PaneWidget] = []
         self._active = 0
+        self._rebuilding = False
         self._grave: list[PaneWidget] = []
 
         self._host = QWidget(self)
@@ -267,6 +268,10 @@ class WorkspaceWidget(QWidget):
     def focus_pane(self, pane: PaneWidget) -> None:
         if pane not in self._panes:
             return
+        if self._rebuilding:
+            # Al ocultar la terminal con el foco, Qt se lo pasa a otra terminal.
+            # Eso no es una selección del usuario: no debe cambiar el activo.
+            return
         index = self._panes.index(pane)
         if index != self._active:
             self._active = index
@@ -390,6 +395,22 @@ class WorkspaceWidget(QWidget):
         return splitter
 
     def _rebuild(self) -> None:
+        # Reconstruir el árbol oculta la terminal con el foco y Qt se lo pasa a
+        # otra terminal: mientras tanto, focus_pane no debe tocar el activo.
+        had_focus = any(
+            pane.terminal is not None and pane.terminal.hasFocus() for pane in self._panes
+        )
+        self._rebuilding = True
+        try:
+            self._rebuild_tree()
+        finally:
+            self._rebuilding = False
+        if had_focus:
+            # Devolver el foco al panel activo: al ocultarse la anterior, Qt
+            # había movido el foco a otra terminal del mosaico.
+            self._focus_terminal()
+
+    def _rebuild_tree(self) -> None:
         # 1) rescatar todos los paneles del árbol anterior (sin destruirlos)
         for pane in self._panes:
             pane.setParent(self._host)

@@ -690,10 +690,9 @@ class MainWindow(QMainWindow):
         )
         self.file_browser.assignRequested.connect(self.assign_directory_to_active)
         self.file_browser.filesRequested.connect(self.insert_files_into_active)
-        self.file_browser.newPanelRequested.connect(
-            lambda path: self.choose_agent(new_tab=False, cwd_hint=path)
-        )
         self.file_browser.showHiddenChanged.connect(self._on_show_hidden_changed)
+        self.file_browser.remoteRequested.connect(self._load_active_remote)
+        self.file_browser.remoteAssignRequested.connect(self.assign_remote_directory_to_active)
         self.file_dock.setWidget(self.file_browser)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
         self.file_dock.setMinimumWidth(260)
@@ -985,6 +984,114 @@ class MainWindow(QMainWindow):
         if host.remote_agent:
             return find_agent(self.config.agents, host.remote_agent)
         return None
+
+    @staticmethod
+    def _host_from_agent(agent) -> SshHost | None:
+        """Reconstruye el equipo desde el ``argv`` de ``ssh`` del propio panel.
+
+        Cubre las conexiones que no se guardaron en la configuración: el panel
+        ya lleva el destino, el puerto y la identidad con los que se conectó.
+        """
+        argv = list(getattr(agent, "command", []) or [])
+        if not argv or not os.path.basename(argv[0]).startswith("ssh"):
+            return None
+        if "--" not in argv:
+            return None
+        cut = argv.index("--")
+        if cut + 1 >= len(argv):
+            return None
+        host = SshHost.parse(argv[cut + 1])
+        if host is None:
+            return None
+        index = 1
+        while index < cut:
+            token = argv[index]
+            value = argv[index + 1] if index + 1 < cut else ""
+            if token == "-p" and value.isdigit():
+                host.port = int(value)
+                index += 2
+            elif token == "-i" and value:
+                host.identity = value
+                index += 2
+            elif token == "-o" and value:
+                host.options.append(value)
+                index += 2
+            else:
+                index += 1
+        agent_id = str(getattr(agent, "id", "") or "")
+        rest = agent_id[len("ssh:") :]
+        if rest.startswith(host.target + ":"):
+            host.remote_agent = rest[len(host.target) + 1 :]
+        host.name = str(getattr(agent, "name", "") or "")
+        return host
+
+    def _pane_ssh_host(self, pane) -> SshHost | None:
+        """Equipo SSH de un panel, a partir del id de su agente (``ssh:destino[:agente]``).
+
+        Los paneles solo guardan un ``Agent`` (el ``argv`` de ``ssh`` dentro de
+        una terminal real), así que el equipo se busca entre las conexiones
+        guardadas y, si no está, se reconstruye del propio comando del panel.
+        """
+        agent = getattr(pane, "agent", None) if pane is not None else None
+        agent_id = str(getattr(agent, "id", "") or "")
+        if not agent_id.startswith("ssh:"):
+            return None
+        rest = agent_id[len("ssh:") :]
+        candidates = [
+            host
+            for host in self.config.ssh_hosts
+            if host.target and (rest == host.target or rest.startswith(host.target + ":"))
+        ]
+        live = self._host_from_agent(agent)
+        if live is not None:
+            for host in candidates:
+                if int(host.port or 22) == int(live.port or 22):
+                    return host
+        if candidates:
+            return candidates[0]
+        return live
+
+    def _active_ssh_host(self) -> SshHost | None:
+        """Equipo SSH del panel activo (vacío si no es un panel remoto)."""
+        workspace = self.workspace()
+        return self._pane_ssh_host(workspace.active_pane() if workspace else None)
+
+    def _load_active_remote(self) -> None:
+        """Botón del explorador: carga el árbol de archivos del PC del panel activo."""
+        host = self._active_ssh_host()
+        if host is None:
+            self.statusBar().showMessage(
+                "El panel activo no es una conexión SSH: abre un panel remoto y púlsalo otra vez.",
+                5000,
+            )
+            return
+        self.file_browser.show_remote(host)
+        self.statusBar().showMessage(f"Cargando los archivos de {host.label}…", 4000)
+
+    def assign_remote_directory_to_active(self, path: str) -> None:
+        """Re-ancla un panel SSH dentro de una carpeta remota (reconectar allí)."""
+        workspace = self.workspace()
+        pane = workspace.active_pane() if workspace else None
+        host = self._pane_ssh_host(pane)
+        if pane is None or host is None or not path:
+            return
+        remote = self._remote_for_host(host)
+        remote_command = list(remote.command) if remote is not None and remote.id != "shell" else None
+        old = pane.agent
+        pane.agent = Agent(
+            id=old.id,
+            name=old.name,
+            command=host.command_with_cwd(path, remote_command),
+            emoji=old.emoji,
+            color=old.color,
+            description=old.description,
+            cwd=old.cwd,
+            env=dict(old.env),
+        )
+        pane.restart()
+        self.statusBar().showMessage(
+            f"{pane.agent.name} → {path} · reconectando en esa carpeta remota", 5000
+        )
 
     def open_ssh(self, host: SshHost, remote: Agent | None = None) -> None:
         """Abre una sesión SSH en una pestaña nueva (una terminal real por conexión)."""
